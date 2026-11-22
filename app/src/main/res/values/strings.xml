@@ -1,0 +1,23 @@
+<resources>
+    <string name="app_name">WASL</string>
+    <string name="app_name_ar">وَصْل</string>
+    <string name="secure_sms_messaging">نظام المراسلة المشفرة عبر SMS</string>
+    <string name="no_chats_yet">لا توجد محادثات حتى الآن</string>
+    <string name="start_new_chat">اضغط على زر (+) لبدء محادثة مشفرة جديدة</string>
+    <string name="search_chats">بحث في المحادثات...</string>
+    <string name="type_encrypted_message">اكتب رسالة مشفرة...</string>
+    <string name="encrypted_via_sms">محادثة مشفرة عبر SMS</string>
+    <string name="handshake_completed">اكتمل التأسيس المشفر عبر SMS طرفاً لطرف</string>
+    <string name="select_sim_title">اختيار شريحة الإرسال</string>
+    <string name="select_sim_desc">حدد الشريحة الافتراضية لإرسال رسائل هذه المحادثة:</string>
+    <string name="confirm_reject_title">تأكيد الرفض</string>
+    <string name="confirm_reject_desc">هل أنت متأكد من رفض طلب تأسيس المحادثة؟</string>
+    <string name="reject_button">تأكيد الرفض</string>
+    <string name="return_button">العودة</string>
+    <string name="accept_button">موافقة</string>
+    <string name="retry_send">إعادة المحاولة</string>
+    <string name="cancel_request">إلغاء الطلب</string>
+    <string name="resend_request">إعادة إرسال الطلب</string>
+    <string name="waiting_for_response">بانتظار موافقة الطرف الآخر...</string>
+    <string name="request_rejected_cooldown">تم رفض الطلب. يمكنك إرسال طلب جديد بعد:</string>
+</resources>
