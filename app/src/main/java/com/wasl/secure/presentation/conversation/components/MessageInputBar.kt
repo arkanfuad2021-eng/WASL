@@ -9,6 +9,8 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -52,6 +54,8 @@ fun MessageInputBar(
     Column(
         modifier = modifier
             .fillMaxWidth()
+            .navigationBarsPadding()
+            .imePadding()
             .background(MaterialTheme.colorScheme.surfaceVariant)
             .border(width = 0.5.dp, color = customColors.divider)
             .padding(horizontal = 12.dp, vertical = 8.dp)
@@ -76,7 +80,7 @@ fun MessageInputBar(
                 modifier = Modifier
                     .clip(RoundedCornerShape(6.dp))
                     .background(customColors.sentBubble.copy(alpha = 0.12f))
-                    .padding(horizontal = 8.dp, vertical = 2.dp)
+                .padding(horizontal = 8.dp, vertical = 2.dp)
             ) {
                 Text(
                     text = "$estimatedSmsParts SMS (مشفر)",
@@ -153,11 +157,8 @@ fun MessageInputBar(
 private fun calculatePostEncryptionSmsParts(plainText: String): Int {
     if (plainText.isEmpty()) return 1
     val plainBytes = plainText.toByteArray(Charsets.UTF_8).size
-    // AES-GCM Tag (16 bytes) + Nonce (12 bytes) + Protocol header overhead (~26 bytes)
     val totalCipherBytes = plainBytes + 16 + 12 + 26
-    // Base64 encoding expands size by ~33%
     val base64Length = ((totalCipherBytes + 2) / 3) * 4
-    // Cellular SMS payload capacity per chunk (~130 chars)
     val parts = (base64Length + 129) / 130
     return if (parts < 1) 1 else parts
 }

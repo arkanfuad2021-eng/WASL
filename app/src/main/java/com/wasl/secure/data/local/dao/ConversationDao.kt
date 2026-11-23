@@ -20,6 +20,9 @@ interface ConversationDao {
     @Query("SELECT * FROM conversations WHERE phoneNumber = :phoneNumber LIMIT 1")
     suspend fun getConversationByPhone(phoneNumber: String): ConversationEntity?
 
+    @Query("SELECT * FROM conversations WHERE phoneNumber LIKE '%' || :comparableDigits LIMIT 1")
+    suspend fun getConversationByComparableDigits(comparableDigits: String): ConversationEntity?
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertOrUpdate(conversation: ConversationEntity)
 

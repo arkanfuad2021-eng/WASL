@@ -3,6 +3,7 @@ package com.wasl.secure.presentation.chats
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -14,16 +15,20 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.DarkMode
 import androidx.compose.material.icons.filled.LightMode
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Divider
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -44,7 +49,6 @@ import com.wasl.secure.R
 import com.wasl.secure.core.theme.LocalWaslColors
 import com.wasl.secure.core.theme.ThmanyahBlack
 import com.wasl.secure.domain.model.Conversation
-import com.wasl.secure.domain.model.HandshakeStatus
 import com.wasl.secure.presentation.chats.components.ChatItemRow
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -59,24 +63,51 @@ fun ChatsListScreen(
 ) {
     val customColors = LocalWaslColors.current
     var selectedConversationForAction by remember { mutableStateOf<Conversation?>(null) }
+    var isSearching by remember { mutableStateOf(false) }
+    var searchQuery by remember { mutableStateOf("") }
+
+    val filteredConversations = remember(conversations, searchQuery) {
+        if (searchQuery.isBlank()) {
+            conversations
+        } else {
+            conversations.filter {
+                it.contactName.contains(searchQuery, ignoreCase = true) ||
+                        it.phoneNumber.contains(searchQuery)
+            }
+        }
+    }
 
     Scaffold(
         topBar = {
             TopAppBar(
                 title = {
-                    Box(modifier = Modifier.fillMaxWidth()) {
-                        Text(
-                            text = "WASL | وَصْل",
-                            fontFamily = ThmanyahBlack,
-                            fontSize = 20.sp,
-                            color = customColors.textPrimary
+                    if (isSearching) {
+                        OutlinedTextField(
+                            value = searchQuery,
+                            onValueChange = { searchQuery = it },
+                            placeholder = { Text("بحث بالاسم أو الرقم...") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(12.dp)
                         )
+                    } else {
+                        Box(modifier = Modifier.fillMaxWidth()) {
+                            Text(
+                                text = "WASL | وَصْل",
+                                fontFamily = ThmanyahBlack,
+                                fontSize = 20.sp,
+                                color = customColors.textPrimary
+                            )
+                        }
                     }
                 },
                 actions = {
-                    IconButton(onClick = { /* Search */ }) {
+                    IconButton(onClick = {
+                        isSearching = !isSearching
+                        if (!isSearching) searchQuery = ""
+                    }) {
                         Icon(
-                            imageVector = Icons.Default.Search,
+                            imageVector = if (isSearching) Icons.Default.Close else Icons.Default.Search,
                             contentDescription = "Search",
                             tint = customColors.textSecondary
                         )
@@ -115,7 +146,7 @@ fun ChatsListScreen(
                 .fillMaxSize()
                 .padding(paddingValues)
         ) {
-            if (conversations.isEmpty()) {
+            if (filteredConversations.isEmpty()) {
                 // Clean empty state
                 Column(
                     modifier = Modifier
@@ -140,21 +171,31 @@ fun ChatsListScreen(
                     }
                     Spacer(modifier = Modifier.height(16.dp))
                     Text(
-                        text = stringResource(R.string.no_chats_yet),
+                        text = if (searchQuery.isNotBlank()) "لا توجد نتائج مطابقة للبحث" else stringResource(R.string.no_chats_yet),
                         style = MaterialTheme.typography.titleMedium,
                         color = customColors.textPrimary
                     )
                     Spacer(modifier = Modifier.height(6.dp))
                     Text(
-                        text = stringResource(R.string.start_new_chat),
+                        text = if (searchQuery.isNotBlank()) "تحقق من صحة الاسم أو رقم الهاتف" else stringResource(R.string.start_new_chat),
                         style = MaterialTheme.typography.bodyMedium,
                         color = customColors.textSecondary
                     )
+                    Spacer(modifier = Modifier.height(20.dp))
+                    if (searchQuery.isBlank()) {
+                        Button(
+                            onClick = onNewChatClick,
+                            colors = ButtonDefaults.buttonColors(containerColor = customColors.sentBubble),
+                            shape = RoundedCornerShape(12.dp)
+                        ) {
+                            Text("بدء محادثة مشفرة جديدة")
+                        }
+                    }
                     Spacer(modifier = Modifier.weight(1.5f))
                 }
             } else {
                 LazyColumn(modifier = Modifier.fillMaxSize()) {
-                    items(conversations, key = { it.id }) { conversation ->
+                    items(filteredConversations, key = { it.id }) { conversation ->
                         ChatItemRow(
                             conversation = conversation,
                             onClick = { onChatClick(conversation.id) },
@@ -184,7 +225,7 @@ fun ChatsListScreen(
             },
             text = {
                 Text(
-                    text = "خيارات المحادثة المشفرة:",
+                    text = "خيارات المحادثة المشفرة (${conversation.phoneNumber}):",
                     style = MaterialTheme.typography.bodyMedium,
                     color = customColors.textSecondary
                 )

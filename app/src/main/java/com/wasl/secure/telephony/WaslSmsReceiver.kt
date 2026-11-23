@@ -5,16 +5,21 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.provider.Telephony
+import android.telephony.SmsManager
 import android.util.Base64
 import com.wasl.secure.WaslApplication
 import com.wasl.secure.core.crypto.AesGcmCipher
 import com.wasl.secure.core.protocol.ChatMessageCodec
+import com.wasl.secure.core.protocol.HandshakePacket
 import com.wasl.secure.core.protocol.HandshakePacketCodec
+import com.wasl.secure.core.util.YemenPhoneUtils
+import com.wasl.secure.data.local.entity.ConversationEntity
 import com.wasl.secure.data.local.entity.MessageEntity
 import com.wasl.secure.domain.model.MessageStatus
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import java.util.UUID
 
 class WaslSmsReceiver : BroadcastReceiver() {
 
@@ -63,7 +68,7 @@ class WaslSmsReceiver : BroadcastReceiver() {
                 if (ChatMessageCodec.isEncryptedChatMessage(smsBody)) {
                     processIncomingEncryptedMessage(context, app, smsBody, originatingAddress)
                 } else if (HandshakePacketCodec.isWaslHandshakeMessage(smsBody)) {
-                    processIncomingHandshake(app, smsBody, originatingAddress)
+                    processIncomingHandshake(context, app, smsBody, originatingAddress)
                 }
             } finally {
                 pendingResult.finish()
@@ -82,14 +87,12 @@ class WaslSmsReceiver : BroadcastReceiver() {
 
         // 1. Process chunk through Reassembly Buffer
         val reassembled = MessageChunkManager.processIncomingChunk(packet, db.messageChunkDao())
-        if (reassembled == null) {
-            // Still waiting for remaining parts to arrive (out-of-order handling)
-            return
-        }
+            ?: return // Still waiting for remaining parts
 
-        // 2. All parts have arrived! Fetch conversation and inbound session key
+        // 2. Resolve conversation using ID or comparable phone digits
+        val comparableDigits = YemenPhoneUtils.extractComparableKey(fromPhone)
         val conv = db.conversationDao().getConversationById(reassembled.conversationId)
-            ?: db.conversationDao().getConversationByPhone(fromPhone)
+            ?: db.conversationDao().getConversationByComparableDigits(comparableDigits)
             ?: return
 
         val inboundKeyB64 = conv.inboundSessionKeyBase64 ?: return
@@ -100,8 +103,7 @@ class WaslSmsReceiver : BroadcastReceiver() {
         val decryptedBytes = try {
             AesGcmCipher.decrypt(inboundKey, reassembled.nonce, reassembled.fullCiphertextWithTag, aad)
         } catch (e: Exception) {
-            // Reassembly or authentication failed; drop corrupted payload
-            return
+            return // Reassembly or authentication failed; drop corrupted payload
         }
 
         val plainText = String(decryptedBytes, Charsets.UTF_8)
@@ -131,7 +133,7 @@ class WaslSmsReceiver : BroadcastReceiver() {
         )
         db.conversationDao().update(updatedConv)
 
-        // 6. Post notification
+        // 6. Post discrete notification
         val notificationHelper = NotificationHelper(context)
         notificationHelper.showIncomingMessageNotification(
             conversationId = conv.id,
@@ -142,12 +144,117 @@ class WaslSmsReceiver : BroadcastReceiver() {
     }
 
     private suspend fun processIncomingHandshake(
+        context: Context,
         app: WaslApplication,
         smsBody: String,
         fromPhone: String
     ) {
         val packet = HandshakePacketCodec.decode(smsBody) ?: return
-        // Process handshake message
+        val db = app.database
+        val normalizedPhone = YemenPhoneUtils.normalize(fromPhone)
+        val comparableDigits = YemenPhoneUtils.extractComparableKey(fromPhone)
+
+        when (packet) {
+            is HandshakePacket.Init -> {
+                val isValid = app.handshakeManager.verifyIncomingInit(packet)
+                if (!isValid) return
+
+                var conv = db.conversationDao().getConversationByComparableDigits(comparableDigits)
+                val now = System.currentTimeMillis()
+                val peerIdentityB64 = Base64.encodeToString(packet.identityPublicKey, Base64.NO_WRAP)
+
+                if (conv == null) {
+                    conv = ConversationEntity(
+                        id = UUID.randomUUID().toString(),
+                        contactName = normalizedPhone,
+                        phoneNumber = normalizedPhone,
+                        lastMessage = "🔒 طلب تأسيس اتصال مشفر",
+                        lastMessageTimestamp = now,
+                        unreadCount = 1,
+                        handshakeStatus = "WAITING",
+                        defaultSubscriptionId = null,
+                        rejectedAt = null,
+                        currentRequestId = packet.requestId,
+                        peerIdentityKeyBase64 = peerIdentityB64,
+                        sessionKeyBase64 = null,
+                        inboundSessionKeyBase64 = null,
+                        nextOutboundCounter = 1L
+                    )
+                    db.conversationDao().insertOrUpdate(conv)
+                } else {
+                    db.conversationDao().update(
+                        conv.copy(
+                            handshakeStatus = "WAITING",
+                            currentRequestId = packet.requestId,
+                            peerIdentityKeyBase64 = peerIdentityB64,
+                            lastMessage = "🔒 طلب تأسيس اتصال مشفر",
+                            lastMessageTimestamp = now,
+                            unreadCount = conv.unreadCount + 1
+                        )
+                    )
+                }
+
+                val notificationHelper = NotificationHelper(context)
+                notificationHelper.showIncomingMessageNotification(
+                    conversationId = conv.id,
+                    senderName = conv.contactName,
+                    decryptedContent = "طلب تأسيس اتصال مشفر جديد",
+                    hideContent = true
+                )
+            }
+            is HandshakePacket.Response -> {
+                val conv = db.conversationDao().getConversationByComparableDigits(comparableDigits) ?: return
+                val confirmResult = try {
+                    app.handshakeManager.processResponse(packet)
+                } catch (e: Exception) {
+                    null
+                } ?: return
+
+                val outKeyB64 = Base64.encodeToString(confirmResult.sessionKeys.outboundKey, Base64.NO_WRAP)
+                val inKeyB64 = Base64.encodeToString(confirmResult.sessionKeys.inboundKey, Base64.NO_WRAP)
+                val peerIdentityB64 = Base64.encodeToString(packet.identityPublicKey, Base64.NO_WRAP)
+
+                db.conversationDao().update(
+                    conv.copy(
+                        handshakeStatus = "READY",
+                        peerIdentityKeyBase64 = peerIdentityB64,
+                        sessionKeyBase64 = outKeyB64,
+                        inboundSessionKeyBase64 = inKeyB64,
+                        lastMessage = "✅ تم تأسيس التشفير بنجاح",
+                        lastMessageTimestamp = System.currentTimeMillis()
+                    )
+                )
+
+                // Transmit confirmation SMS back to peer
+                try {
+                    val smsManager = SmsManager.getDefault()
+                    smsManager.sendTextMessage(normalizedPhone, null, confirmResult.smsPayload, null, null)
+                } catch (e: Exception) {
+                    // Suppressed
+                }
+            }
+            is HandshakePacket.Confirm -> {
+                val conv = db.conversationDao().getConversationByComparableDigits(comparableDigits) ?: return
+                db.conversationDao().update(
+                    conv.copy(
+                        handshakeStatus = "READY",
+                        lastMessage = "✅ تم تأسيس التشفير بنجاح",
+                        lastMessageTimestamp = System.currentTimeMillis()
+                    )
+                )
+            }
+            is HandshakePacket.Reject -> {
+                val conv = db.conversationDao().getConversationByComparableDigits(comparableDigits) ?: return
+                db.conversationDao().update(
+                    conv.copy(
+                        handshakeStatus = "REJECTED",
+                        rejectedAt = System.currentTimeMillis(),
+                        lastMessage = "تم رفض طلب الاتصال المشفر",
+                        lastMessageTimestamp = System.currentTimeMillis()
+                    )
+                )
+            }
+        }
     }
 
     private fun handleSmsSentReport(context: Context, intent: Intent) {

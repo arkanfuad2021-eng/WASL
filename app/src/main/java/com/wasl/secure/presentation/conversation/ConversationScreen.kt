@@ -10,10 +10,16 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -22,11 +28,17 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -50,10 +62,12 @@ import com.wasl.secure.core.theme.LocalWaslColors
 import com.wasl.secure.core.theme.ThmanyahBlack
 import com.wasl.secure.core.theme.WaslEmeraldActive
 import com.wasl.secure.domain.model.Conversation
+import com.wasl.secure.domain.model.HandshakeStatus
 import com.wasl.secure.domain.model.Message
 import com.wasl.secure.domain.model.SimInfo
 import com.wasl.secure.presentation.conversation.components.MessageBubble
 import com.wasl.secure.presentation.conversation.components.MessageInputBar
+import com.wasl.secure.presentation.conversation.components.SafetyNumberDialog
 import com.wasl.secure.presentation.conversation.components.SimSelectionDialog
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -63,15 +77,21 @@ fun ConversationScreen(
     messages: List<Message>,
     availableSims: List<SimInfo>,
     currentSubId: Int?,
+    ourIdentityKey: ByteArray,
+    peerIdentityKeyBase64: String?,
     onBackClick: () -> Unit,
     onSendMessage: (String, Int?) -> Unit,
     onSelectSim: (Int) -> Unit,
-    onDeleteMessage: (String) -> Unit
+    onDeleteMessage: (String) -> Unit,
+    onInitiateHandshake: () -> Unit,
+    onAcceptHandshake: () -> Unit,
+    onRejectHandshake: () -> Unit
 ) {
     val context = LocalContext.current
     val customColors = LocalWaslColors.current
     var inputText by remember { mutableStateOf("") }
     var showSimDialog by remember { mutableStateOf(false) }
+    var showSafetyDialog by remember { mutableStateOf(false) }
     var selectedMessageForAction by remember { mutableStateOf<Message?>(null) }
     var showHighCostSmsWarning by remember { mutableStateOf(false) }
 
@@ -84,6 +104,7 @@ fun ConversationScreen(
     }
 
     Scaffold(
+        contentWindowInsets = WindowInsets.statusBars,
         topBar = {
             TopAppBar(
                 title = {
@@ -115,17 +136,19 @@ fun ConversationScreen(
                                 color = customColors.textPrimary
                             )
                             Row(verticalAlignment = Alignment.CenterVertically) {
+                                val isEncryptedReady = conversation.handshakeStatus == HandshakeStatus.READY
+                                val statusDotColor = if (isEncryptedReady) WaslEmeraldActive else MaterialTheme.colorScheme.tertiary
                                 Box(
                                     modifier = Modifier
                                         .size(6.dp)
                                         .clip(RoundedCornerShape(3.dp))
-                                        .background(WaslEmeraldActive)
+                                        .background(statusDotColor)
                                 )
                                 Spacer(modifier = Modifier.width(4.dp))
                                 Text(
-                                    text = stringResource(R.string.encrypted_via_sms),
+                                    text = if (isEncryptedReady) "مشفر عبر SMS (اليمن)" else "في انتظار تأسيس المفاتيح",
                                     style = MaterialTheme.typography.labelSmall,
-                                    color = WaslEmeraldActive,
+                                    color = statusDotColor,
                                     fontSize = 10.sp
                                 )
                             }
@@ -143,31 +166,26 @@ fun ConversationScreen(
                 },
                 actions = {
                     // Active SIM Indicator badge (Clickable to switch SIMs if multi-SIM)
-                    val activeSimName = availableSims.find { it.subscriptionId == currentSubId }?.displayName ?: "SIM 1"
-                    Box(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(customColors.sentBubble.copy(alpha = 0.1f))
-                            .clickable {
-                                if (availableSims.size > 1) {
-                                    showSimDialog = true
-                                } else {
-                                    val activeSim = availableSims.firstOrNull()
-                                    val simDesc = if (activeSim != null) "${activeSim.displayName} (${activeSim.carrierName})" else "SIM 1"
-                                    Toast.makeText(context, "الشريحة المتاحة الوحيدة: $simDesc", Toast.LENGTH_SHORT).show()
-                                }
-                            }
-                            .padding(horizontal = 8.dp, vertical = 4.dp)
-                    ) {
-                        Text(
-                            text = activeSimName,
-                            style = MaterialTheme.typography.labelSmall,
-                            color = customColors.sentBubble,
-                            fontSize = 11.sp
-                        )
+                    if (availableSims.size > 1) {
+                        val activeSimName = availableSims.find { it.subscriptionId == currentSubId }?.displayName ?: "SIM 1"
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(customColors.sentBubble.copy(alpha = 0.1f))
+                                .clickable { showSimDialog = true }
+                                .padding(horizontal = 8.dp, vertical = 4.dp)
+                        ) {
+                            Text(
+                                text = activeSimName,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = customColors.sentBubble,
+                                fontSize = 11.sp
+                            )
+                        }
                     }
 
-                    IconButton(onClick = { /* Security / Safety Number info */ }) {
+                    // Safety Number / Verification Dialog button
+                    IconButton(onClick = { showSafetyDialog = true }) {
                         Icon(
                             imageVector = Icons.Default.Info,
                             contentDescription = "Security Info",
@@ -181,33 +199,104 @@ fun ConversationScreen(
             )
         },
         bottomBar = {
-            MessageInputBar(
-                text = inputText,
-                onTextChanged = { inputText = it },
-                onSendClick = {
-                    val plainBytes = inputText.toByteArray(Charsets.UTF_8).size
-                    val totalCipherBytes = plainBytes + 16 + 12 + 26
-                    val base64Length = ((totalCipherBytes + 2) / 3) * 4
-                    val estimatedParts = (base64Length + 129) / 130
+            if (conversation.handshakeStatus == HandshakeStatus.READY) {
+                MessageInputBar(
+                    text = inputText,
+                    onTextChanged = { inputText = it },
+                    onSendClick = {
+                        val plainBytes = inputText.toByteArray(Charsets.UTF_8).size
+                        val totalCipherBytes = plainBytes + 16 + 12 + 26
+                        val base64Length = ((totalCipherBytes + 2) / 3) * 4
+                        val estimatedParts = (base64Length + 129) / 130
 
-                    if (estimatedParts > 10) {
-                        showHighCostSmsWarning = true
-                    } else {
-                        onSendMessage(inputText, currentSubId)
-                        inputText = ""
+                        if (estimatedParts > 10) {
+                            showHighCostSmsWarning = true
+                        } else {
+                            onSendMessage(inputText, currentSubId)
+                            inputText = ""
+                        }
+                    },
+                    onSendLongClick = {
+                        if (availableSims.size > 1) {
+                            showSimDialog = true
+                        } else {
+                            val activeSim = availableSims.firstOrNull()
+                            val simDesc = if (activeSim != null) "${activeSim.displayName} (${activeSim.carrierName})" else "SIM 1"
+                            Toast.makeText(context, "الشريحة الوحيدة: $simDesc", Toast.LENGTH_SHORT).show()
+                        }
+                    },
+                    simDisplayName = availableSims.find { it.subscriptionId == currentSubId }?.displayName
+                )
+            } else {
+                // Handshake Action Bar
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .navigationBarsPadding()
+                        .imePadding()
+                        .background(MaterialTheme.colorScheme.surfaceVariant)
+                        .padding(16.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    when (conversation.handshakeStatus) {
+                        HandshakeStatus.WAITING -> {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Text(
+                                    text = "⏳ في انتظار اكتمال المصافحة وتبادل المفاتيح مع الطرف الآخر...",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = customColors.textSecondary
+                                )
+                                Spacer(modifier = Modifier.height(10.dp))
+                                Row {
+                                    Button(
+                                        onClick = onAcceptHandshake,
+                                        colors = ButtonDefaults.buttonColors(containerColor = customColors.sentBubble),
+                                        shape = RoundedCornerShape(10.dp)
+                                    ) {
+                                        Text("قبول وتبادل المفاتيح")
+                                    }
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    OutlinedButton(
+                                        onClick = onInitiateHandshake,
+                                        shape = RoundedCornerShape(10.dp)
+                                    ) {
+                                        Text("إرسال طلب تأسيس", color = customColors.textPrimary)
+                                    }
+                                }
+                            }
+                        }
+                        HandshakeStatus.REJECTED -> {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Text(
+                                    text = "تم رفض طلب الاتصال المشفر سابقاً.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.error
+                                )
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Button(
+                                    onClick = onInitiateHandshake,
+                                    colors = ButtonDefaults.buttonColors(containerColor = customColors.sentBubble),
+                                    shape = RoundedCornerShape(10.dp)
+                                ) {
+                                    Text("محاولة التأسيس مجدداً")
+                                }
+                            }
+                        }
+                        else -> {
+                            Button(
+                                onClick = onInitiateHandshake,
+                                colors = ButtonDefaults.buttonColors(containerColor = customColors.sentBubble),
+                                shape = RoundedCornerShape(12.dp),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Icon(Icons.Default.Lock, contentDescription = null, modifier = Modifier.size(18.dp))
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text("إرسال طلب مصافحة مشفرة (Handshake SMS)")
+                            }
+                        }
                     }
-                },
-                onSendLongClick = {
-                    if (availableSims.size > 1) {
-                        showSimDialog = true
-                    } else {
-                        val activeSim = availableSims.firstOrNull()
-                        val simDesc = if (activeSim != null) "${activeSim.displayName} (${activeSim.carrierName})" else "SIM 1"
-                        Toast.makeText(context, "الشريحة المتاحة الوحيدة: $simDesc", Toast.LENGTH_SHORT).show()
-                    }
-                },
-                simDisplayName = availableSims.find { it.subscriptionId == currentSubId }?.displayName
-            )
+                }
+            }
         },
         containerColor = MaterialTheme.colorScheme.background
     ) { paddingValues ->
@@ -237,7 +326,10 @@ fun ConversationScreen(
                                 .padding(horizontal = 14.dp, vertical = 6.dp)
                         ) {
                             Text(
-                                text = "🔒 " + stringResource(R.string.handshake_completed),
+                                text = if (conversation.handshakeStatus == HandshakeStatus.READY)
+                                    "🔒 " + stringResource(R.string.handshake_completed)
+                                else
+                                    "🔒 محادثة عبر شبكة الرسائل الخلوية - بدون إنترنت",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = customColors.securityBadgeText,
                                 fontSize = 11.sp
@@ -255,6 +347,16 @@ fun ConversationScreen(
                 }
             }
         }
+    }
+
+    // Safety Number Verification Dialog
+    if (showSafetyDialog) {
+        SafetyNumberDialog(
+            contactName = conversation.contactName,
+            ourIdentityKey = ourIdentityKey,
+            peerIdentityKeyBase64 = peerIdentityKeyBase64,
+            onDismiss = { showSafetyDialog = false }
+        )
     }
 
     // High SMS parts confirmation dialog (> 10 SMS parts)

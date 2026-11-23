@@ -5,6 +5,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -19,9 +20,11 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import com.wasl.secure.core.theme.LocalWaslColors
 import com.wasl.secure.core.theme.ThmanyahBlack
+import com.wasl.secure.core.util.YemenPhoneUtils
 
 @Composable
 fun NewChatDialog(
@@ -31,7 +34,7 @@ fun NewChatDialog(
 ) {
     val customColors = LocalWaslColors.current
     var name by remember { mutableStateOf("") }
-    var phone by remember { mutableStateOf("") }
+    var rawPhone by remember { mutableStateOf("+967") }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -45,7 +48,7 @@ fun NewChatDialog(
         text = {
             Column(modifier = Modifier.fillMaxWidth()) {
                 Text(
-                    text = "اختر جهة اتصال من هاتفك أو أدخل رقم الهاتف مباشرة:",
+                    text = "اختر جهة اتصال من هاتفك أو أدخل الرقم المباشر بالصيغة اليمنية (+967xxxxxxxxx):",
                     style = MaterialTheme.typography.bodySmall,
                     color = customColors.textSecondary
                 )
@@ -77,7 +80,7 @@ fun NewChatDialog(
                 OutlinedTextField(
                     value = name,
                     onValueChange = { name = it },
-                    label = { Text("اسم جهة الاتصال") },
+                    label = { Text("اسم جهة الاتصال (اختياري)") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(12.dp)
@@ -86,10 +89,15 @@ fun NewChatDialog(
                 Spacer(modifier = Modifier.height(8.dp))
 
                 OutlinedTextField(
-                    value = phone,
-                    onValueChange = { phone = it },
-                    label = { Text("رقم الهاتف الخلوي") },
-                    placeholder = { Text("+9665xxxxxxxx") },
+                    value = rawPhone,
+                    onValueChange = { input ->
+                        // Only allow digits and leading plus
+                        val filtered = input.filter { it.isDigit() || it == '+' }
+                        rawPhone = filtered
+                    },
+                    label = { Text("رقم الهاتف") },
+                    placeholder = { Text("+967xxxxxxxxx") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(12.dp)
@@ -97,20 +105,23 @@ fun NewChatDialog(
             }
         },
         confirmButton = {
+            val normalizedPhone = YemenPhoneUtils.normalize(rawPhone)
+            val isValid = normalizedPhone.length >= 10
+
             Button(
                 onClick = {
-                    if (phone.isNotBlank()) {
-                        val effectiveName = if (name.isNotBlank()) name else phone
-                        onStartChat(effectiveName, phone)
+                    if (isValid) {
+                        val effectiveName = if (name.isNotBlank()) name else normalizedPhone
+                        onStartChat(effectiveName, normalizedPhone)
                         onDismiss()
                     }
                 },
-                enabled = phone.isNotBlank(),
+                enabled = isValid,
                 colors = ButtonDefaults.buttonColors(
                     containerColor = customColors.sentBubble
                 )
             ) {
-                Text("بدء التأسيس")
+                Text("بدء المحادثة")
             }
         },
         dismissButton = {
