@@ -8,6 +8,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.ContactsContract
+import android.provider.Settings
 import android.telephony.SmsManager
 import android.util.Base64
 import android.widget.Toast
@@ -16,6 +17,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -31,6 +33,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -41,17 +44,24 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import androidx.room.withTransaction
+import com.wasl.secure.core.preferences.WaslPreferences
 import com.wasl.secure.core.theme.LocalWaslColors
 import com.wasl.secure.core.theme.ThmanyahBlack
 import com.wasl.secure.core.theme.WaslTheme
@@ -70,8 +80,11 @@ import com.wasl.secure.domain.usecase.SendMessageUseCase
 import com.wasl.secure.presentation.chats.ChatsListScreen
 import com.wasl.secure.presentation.chats.components.NewChatDialog
 import com.wasl.secure.presentation.conversation.ConversationScreen
+import com.wasl.secure.presentation.details.ConversationDetailsScreen
 import com.wasl.secure.presentation.navigation.Screen
+import com.wasl.secure.presentation.settings.SettingsScreen
 import com.wasl.secure.telephony.NotificationHelper
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.launch
@@ -88,12 +101,17 @@ class MainActivity : ComponentActivity() {
         notificationConversationId.value = intent?.getStringExtra("conversationId")
 
         setContent {
-            var isDarkTheme by remember { mutableStateOf(true) }
+            val preferences = remember { WaslPreferences(applicationContext) }
+            var isDarkTheme by remember { mutableStateOf(preferences.isDarkTheme()) }
 
             WaslTheme(darkTheme = isDarkTheme) {
                 WaslAppNavigation(
                     isDarkTheme = isDarkTheme,
-                    onToggleTheme = { isDarkTheme = !isDarkTheme },
+                    onDarkThemeChange = { enabled ->
+                        isDarkTheme = enabled
+                        preferences.setDarkTheme(enabled)
+                    },
+                    preferences = preferences,
                     pendingNotificationConvId = notificationConversationId.value,
                     onNotificationConvHandled = { notificationConversationId.value = null }
                 )
@@ -111,7 +129,8 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun WaslAppNavigation(
     isDarkTheme: Boolean,
-    onToggleTheme: () -> Unit,
+    onDarkThemeChange: (Boolean) -> Unit,
+    preferences: WaslPreferences,
     pendingNotificationConvId: String? = null,
     onNotificationConvHandled: () -> Unit = {}
 ) {
@@ -121,9 +140,32 @@ fun WaslAppNavigation(
     val navController = rememberNavController()
     val customColors = LocalWaslColors.current
 
-    // Check runtime permissions
+    var warnHighSmsParts by remember { mutableStateOf(preferences.isWarnHighSmsPartsEnabled()) }
+    var hideNotificationContent by remember { mutableStateOf(preferences.isHideNotificationContentEnabled()) }
+    var defaultGlobalSubId by remember { mutableStateOf(preferences.getDefaultGlobalSubId()) }
+
+    // Check runtime permissions and refresh upon returning from system settings
     var hasPermissions by remember {
         mutableStateOf(checkRequiredPermissions(context))
+    }
+    var hasPhoneStatePermission by remember {
+        mutableStateOf(app.simCardManager.hasPhoneStatePermission())
+    }
+    var allPermissionsGranted by remember {
+        mutableStateOf(checkAllAppPermissions(context))
+    }
+
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                hasPermissions = checkRequiredPermissions(context)
+                hasPhoneStatePermission = app.simCardManager.hasPhoneStatePermission()
+                allPermissionsGranted = checkAllAppPermissions(context)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     val permissionsToRequest = remember {
@@ -145,6 +187,8 @@ fun WaslAppNavigation(
         val smsGranted = results[Manifest.permission.SEND_SMS] == true &&
                 results[Manifest.permission.RECEIVE_SMS] == true
         hasPermissions = smsGranted
+        hasPhoneStatePermission = app.simCardManager.hasPhoneStatePermission()
+        allPermissionsGranted = checkAllAppPermissions(context)
     }
 
     if (app.isSecurityLockdown) {
@@ -209,12 +253,21 @@ fun WaslAppNavigation(
             ) {
                 Box(
                     modifier = Modifier
-                        .size(80.dp)
+                        .size(88.dp)
                         .clip(RoundedCornerShape(24.dp))
-                        .background(customColors.sentBubble.copy(alpha = 0.12f)),
+                        .background(
+                            if (isDarkTheme) Color(0xFFF1F5F9)
+                            else customColors.sentBubble.copy(alpha = 0.08f)
+                        )
+                        .padding(10.dp),
                     contentAlignment = Alignment.Center
                 ) {
-                    Text(text = "🔒", fontSize = 36.sp)
+                    Image(
+                        painter = painterResource(id = R.drawable.wasl_logo_mark),
+                        contentDescription = "شعار وَصْل",
+                        modifier = Modifier.fillMaxSize(),
+                        contentScale = ContentScale.Fit
+                    )
                 }
 
                 Spacer(modifier = Modifier.height(24.dp))
@@ -255,8 +308,8 @@ fun WaslAppNavigation(
         return
     }
 
-    // Active SIM cards discovery
-    val activeSims = remember(hasPermissions) {
+    // Active SIM cards discovery (refreshes when SMS or READ_PHONE_STATE permissions change)
+    val activeSims = remember(hasPermissions, hasPhoneStatePermission) {
         app.simCardManager.getActiveSimCards()
     }
 
@@ -285,24 +338,7 @@ fun WaslAppNavigation(
     }
 
     val conversations = remember(conversationEntities) {
-        conversationEntities.map { entity ->
-            Conversation(
-                id = entity.id,
-                contactName = entity.contactName,
-                phoneNumber = entity.phoneNumber,
-                lastMessage = entity.lastMessage,
-                lastMessageTimestamp = entity.lastMessageTimestamp,
-                unreadCount = entity.unreadCount,
-                handshakeStatus = try {
-                    HandshakeStatus.valueOf(entity.handshakeStatus)
-                } catch (e: Exception) {
-                    HandshakeStatus.WAITING
-                },
-                defaultSubscriptionId = entity.defaultSubscriptionId,
-                rejectedAt = entity.rejectedAt,
-                currentRequestId = entity.currentRequestId
-            )
-        }
+        conversationEntities.map { it.toDomainModel() }
     }
 
     var showNewChatDialog by remember { mutableStateOf(false) }
@@ -353,7 +389,7 @@ fun WaslAppNavigation(
                                         lastMessageTimestamp = System.currentTimeMillis(),
                                         unreadCount = 0,
                                         handshakeStatus = "NEW",
-                                        defaultSubscriptionId = activeSims.firstOrNull()?.subscriptionId,
+                                        defaultSubscriptionId = resolveInitialSimId(defaultGlobalSubId, activeSims),
                                         rejectedAt = null,
                                         currentRequestId = null,
                                         peerIdentityKeyBase64 = null,
@@ -384,7 +420,7 @@ fun WaslAppNavigation(
             ChatsListScreen(
                 conversations = conversations,
                 isDarkTheme = isDarkTheme,
-                onToggleTheme = onToggleTheme,
+                onToggleTheme = { onDarkThemeChange(!isDarkTheme) },
                 onChatClick = { conversationId ->
                     navController.navigate(Screen.Conversation.createRoute(conversationId))
                 },
@@ -392,16 +428,10 @@ fun WaslAppNavigation(
                     showNewChatDialog = true
                 },
                 onDeleteChat = { conversationId ->
-                    scope.launch(Dispatchers.IO) {
-                        val packetConvId = conversationId.replace("-", "").take(16)
-                        app.database.withTransaction {
-                            app.database.conversationDao().deleteById(conversationId)
-                            app.database.messageDao().deleteAllForConversation(conversationId)
-                            app.database.messageChunkDao().deleteChunksForConversation(conversationId, packetConvId)
-                            app.database.handshakeDao().deleteForConversation(conversationId)
-                        }
-                        NotificationHelper(context).cancelConversationNotification(conversationId)
-                    }
+                    deleteConversationLocally(app, context, scope, conversationId)
+                },
+                onSettingsClick = {
+                    navController.navigate(Screen.Settings.route)
                 }
             )
 
@@ -427,7 +457,7 @@ fun WaslAppNavigation(
                                     lastMessageTimestamp = System.currentTimeMillis(),
                                     unreadCount = 0,
                                     handshakeStatus = "NEW",
-                                    defaultSubscriptionId = activeSims.firstOrNull()?.subscriptionId,
+                                    defaultSubscriptionId = resolveInitialSimId(defaultGlobalSubId, activeSims),
                                     rejectedAt = null,
                                     currentRequestId = null,
                                     peerIdentityKeyBase64 = null,
@@ -454,24 +484,7 @@ fun WaslAppNavigation(
             val convEntity = conversationEntities.find { it.id == conversationId }
 
             if (convEntity != null) {
-                val conversation = remember(convEntity) {
-                    Conversation(
-                        id = convEntity.id,
-                        contactName = convEntity.contactName,
-                        phoneNumber = convEntity.phoneNumber,
-                        lastMessage = convEntity.lastMessage,
-                        lastMessageTimestamp = convEntity.lastMessageTimestamp,
-                        unreadCount = convEntity.unreadCount,
-                        handshakeStatus = try {
-                            HandshakeStatus.valueOf(convEntity.handshakeStatus)
-                        } catch (e: Exception) {
-                            HandshakeStatus.WAITING
-                        },
-                        defaultSubscriptionId = convEntity.defaultSubscriptionId,
-                        rejectedAt = convEntity.rejectedAt,
-                        currentRequestId = convEntity.currentRequestId
-                    )
-                }
+                val conversation = remember(convEntity) { convEntity.toDomainModel() }
 
                 val messageEntities by app.database.messageDao().getMessagesForConversation(conversationId)
                     .collectAsState(initial = emptyList())
@@ -500,7 +513,7 @@ fun WaslAppNavigation(
                     mutableStateOf(convEntity.defaultSubscriptionId ?: activeSims.firstOrNull()?.subscriptionId)
                 }
 
-                LaunchedEffect(conversationId, activeSims) {
+                LaunchedEffect(conversationId, convEntity.defaultSubscriptionId, activeSims) {
                     activeSubId = app.simCardManager.resolveEffectiveSimForConversation(conversationId)
                 }
 
@@ -509,10 +522,6 @@ fun WaslAppNavigation(
                     if (convEntity.unreadCount > 0) {
                         app.database.conversationDao().markConversationAsRead(conversationId)
                     }
-                }
-
-                val ourIdentityKey = remember {
-                    app.identityManager.getPublicIdentityKey()
                 }
 
                 val currentReqId = convEntity.currentRequestId
@@ -541,11 +550,13 @@ fun WaslAppNavigation(
                     messages = messages,
                     availableSims = activeSims,
                     currentSubId = activeSubId,
-                    ourIdentityKey = ourIdentityKey,
-                    peerIdentityKeyBase64 = convEntity.peerIdentityKeyBase64,
+                    warnHighSmsParts = warnHighSmsParts,
                     isIncomingPendingHandshake = isIncomingPendingHandshake,
                     isIncomingAcceptedHandshake = isIncomingAcceptedHandshake,
                     onBackClick = { navController.popBackStack() },
+                    onOpenDetails = {
+                        navController.navigate(Screen.ConversationDetails.createRoute(conversation.id))
+                    },
                     onSendMessage = { text, subId ->
                         scope.launch(Dispatchers.IO) {
                             val res = sendMessageUseCase(
@@ -960,6 +971,139 @@ fun WaslAppNavigation(
                 )
             }
         }
+
+        composable(
+            route = Screen.ConversationDetails.route,
+            arguments = listOf(navArgument("conversationId") { type = NavType.StringType })
+        ) { backStackEntry ->
+            val conversationId = backStackEntry.arguments?.getString("conversationId") ?: ""
+            val convEntity = conversationEntities.find { it.id == conversationId }
+
+            if (convEntity != null) {
+                val conversation = remember(convEntity) { convEntity.toDomainModel() }
+                var activeSubId by remember(conversationId) {
+                    mutableStateOf(convEntity.defaultSubscriptionId ?: activeSims.firstOrNull()?.subscriptionId)
+                }
+
+                LaunchedEffect(conversationId, convEntity.defaultSubscriptionId, activeSims) {
+                    activeSubId = app.simCardManager.resolveEffectiveSimForConversation(conversationId)
+                }
+
+                val ourIdentityKey = remember {
+                    app.identityManager.getPublicIdentityKey()
+                }
+
+                ConversationDetailsScreen(
+                    conversation = conversation,
+                    availableSims = activeSims,
+                    currentSubId = activeSubId,
+                    ourIdentityKey = ourIdentityKey,
+                    peerIdentityKeyBase64 = convEntity.peerIdentityKeyBase64,
+                    onBackClick = { navController.popBackStack() },
+                    onSelectSim = { newSubId ->
+                        activeSubId = newSubId
+                        scope.launch(Dispatchers.IO) {
+                            app.simCardManager.setConversationSimPreference(conversationId, newSubId)
+                        }
+                    },
+                    onDeleteChat = {
+                        deleteConversationLocally(app, context, scope, conversationId)
+                        navController.popBackStack(Screen.ChatsList.route, inclusive = false)
+                    }
+                )
+            }
+        }
+
+        composable(Screen.Settings.route) {
+            SettingsScreen(
+                isDarkTheme = isDarkTheme,
+                warnHighSmsParts = warnHighSmsParts,
+                hideNotificationContent = hideNotificationContent,
+                defaultGlobalSubId = defaultGlobalSubId,
+                availableSims = activeSims,
+                allPermissionsGranted = allPermissionsGranted,
+                onBackClick = { navController.popBackStack() },
+                onDarkThemeChange = onDarkThemeChange,
+                onWarnHighSmsPartsChange = { enabled ->
+                    warnHighSmsParts = enabled
+                    preferences.setWarnHighSmsPartsEnabled(enabled)
+                },
+                onHideNotificationContentChange = { enabled ->
+                    hideNotificationContent = enabled
+                    preferences.setHideNotificationContentEnabled(enabled)
+                },
+                onSelectGlobalSim = { subId ->
+                    defaultGlobalSubId = subId
+                    preferences.setDefaultGlobalSubId(subId)
+                },
+                onRequestPermissionsClick = {
+                    if (!allPermissionsGranted) {
+                        permissionLauncher.launch(permissionsToRequest)
+                    } else {
+                        openAppSettings(context)
+                    }
+                }
+            )
+        }
+    }
+}
+
+private fun ConversationEntity.toDomainModel(): Conversation {
+    return Conversation(
+        id = id,
+        contactName = contactName,
+        phoneNumber = phoneNumber,
+        lastMessage = lastMessage,
+        lastMessageTimestamp = lastMessageTimestamp,
+        unreadCount = unreadCount,
+        handshakeStatus = try {
+            HandshakeStatus.valueOf(handshakeStatus)
+        } catch (_: Exception) {
+            HandshakeStatus.WAITING
+        },
+        defaultSubscriptionId = defaultSubscriptionId,
+        rejectedAt = rejectedAt,
+        currentRequestId = currentRequestId
+    )
+}
+
+private fun resolveInitialSimId(defaultGlobalSubId: Int, activeSims: List<SimInfo>): Int? {
+    if (defaultGlobalSubId != WaslPreferences.DEFAULT_GLOBAL_SUB_ID &&
+        activeSims.any { it.subscriptionId == defaultGlobalSubId }
+    ) {
+        return defaultGlobalSubId
+    }
+    return activeSims.find { it.isDefaultSms }?.subscriptionId
+        ?: activeSims.firstOrNull()?.subscriptionId
+}
+
+private fun deleteConversationLocally(
+    app: WaslApplication,
+    context: Context,
+    scope: CoroutineScope,
+    conversationId: String
+) {
+    scope.launch(Dispatchers.IO) {
+        val packetConvId = conversationId.replace("-", "").take(16)
+        app.database.withTransaction {
+            app.database.conversationDao().deleteById(conversationId)
+            app.database.messageDao().deleteAllForConversation(conversationId)
+            app.database.messageChunkDao().deleteChunksForConversation(conversationId, packetConvId)
+            app.database.handshakeDao().deleteForConversation(conversationId)
+        }
+        NotificationHelper(context).cancelConversationNotification(conversationId)
+    }
+}
+
+private fun openAppSettings(context: Context) {
+    try {
+        val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+            data = Uri.fromParts("package", context.packageName, null)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        context.startActivity(intent)
+    } catch (_: Exception) {
+        Toast.makeText(context, "تعذر فتح إعدادات التطبيق", Toast.LENGTH_SHORT).show()
     }
 }
 
@@ -967,4 +1111,15 @@ private fun checkRequiredPermissions(context: Context): Boolean {
     val hasSendSms = ContextCompat.checkSelfPermission(context, Manifest.permission.SEND_SMS) == PackageManager.PERMISSION_GRANTED
     val hasReceiveSms = ContextCompat.checkSelfPermission(context, Manifest.permission.RECEIVE_SMS) == PackageManager.PERMISSION_GRANTED
     return hasSendSms && hasReceiveSms
+}
+
+private fun checkAllAppPermissions(context: Context): Boolean {
+    val hasPhone = ContextCompat.checkSelfPermission(context, Manifest.permission.READ_PHONE_STATE) == PackageManager.PERMISSION_GRANTED
+    val hasContacts = ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED
+    val hasNotif = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+    } else {
+        true
+    }
+    return checkRequiredPermissions(context) && hasPhone && hasContacts && hasNotif
 }

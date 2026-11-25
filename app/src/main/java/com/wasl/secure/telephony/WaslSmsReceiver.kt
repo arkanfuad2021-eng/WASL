@@ -10,6 +10,7 @@ import android.util.Base64
 import com.wasl.secure.WaslApplication
 import com.wasl.secure.core.crypto.AesGcmCipher
 import com.wasl.secure.core.crypto.Curve25519Engine
+import com.wasl.secure.core.preferences.WaslPreferences
 import com.wasl.secure.core.protocol.ChatMessageCodec
 import com.wasl.secure.core.protocol.HandshakePacket
 import androidx.room.withTransaction
@@ -162,11 +163,12 @@ class WaslSmsReceiver : BroadcastReceiver() {
 
             // Discrete notification
             val notificationHelper = NotificationHelper(context)
+            val hideContentPref = WaslPreferences(context).isHideNotificationContentEnabled()
             notificationHelper.showIncomingMessageNotification(
                 conversationId = conv.id,
                 senderName = conv.contactName,
                 decryptedContent = plainText,
-                hideContent = false
+                hideContent = hideContentPref
             )
         } else {
             // Message already inserted by another concurrent or prior attempt.

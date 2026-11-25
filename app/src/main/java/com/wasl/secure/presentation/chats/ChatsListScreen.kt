@@ -1,6 +1,8 @@
 package com.wasl.secure.presentation.chats
 
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -19,6 +21,7 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.DarkMode
 import androidx.compose.material.icons.filled.LightMode
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -41,7 +44,10 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -59,7 +65,8 @@ fun ChatsListScreen(
     onToggleTheme: () -> Unit,
     onChatClick: (String) -> Unit,
     onNewChatClick: () -> Unit,
-    onDeleteChat: (String) -> Unit
+    onDeleteChat: (String) -> Unit,
+    onSettingsClick: () -> Unit = {}
 ) {
     val customColors = LocalWaslColors.current
     var selectedConversationForAction by remember { mutableStateOf<Conversation?>(null) }
@@ -91,7 +98,18 @@ fun ChatsListScreen(
                             shape = RoundedCornerShape(12.dp)
                         )
                     } else {
-                        Box(modifier = Modifier.fillMaxWidth()) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Image(
+                                painter = painterResource(id = R.drawable.wasl_brand_badge),
+                                contentDescription = "شعار وَصْل",
+                                modifier = Modifier
+                                    .size(30.dp)
+                                    .clip(RoundedCornerShape(8.dp)),
+                                contentScale = ContentScale.Crop
+                            )
                             Text(
                                 text = "WASL | وَصْل",
                                 fontFamily = ThmanyahBlack,
@@ -116,6 +134,13 @@ fun ChatsListScreen(
                         Icon(
                             imageVector = if (isDarkTheme) Icons.Default.LightMode else Icons.Default.DarkMode,
                             contentDescription = "Toggle Theme",
+                            tint = customColors.textSecondary
+                        )
+                    }
+                    IconButton(onClick = onSettingsClick) {
+                        Icon(
+                            imageVector = Icons.Default.Settings,
+                            contentDescription = "Settings",
                             tint = customColors.textSecondary
                         )
                     }
@@ -157,16 +182,20 @@ fun ChatsListScreen(
                     Spacer(modifier = Modifier.weight(1f))
                     Box(
                         modifier = Modifier
-                            .size(72.dp)
+                            .size(84.dp)
+                            .clip(RoundedCornerShape(24.dp))
                             .background(
-                                customColors.sentBubble.copy(alpha = 0.1f),
-                                RoundedCornerShape(24.dp)
-                            ),
+                                if (isDarkTheme) Color(0xFFF1F5F9)
+                                else customColors.sentBubble.copy(alpha = 0.08f)
+                            )
+                            .padding(10.dp),
                         contentAlignment = Alignment.Center
                     ) {
-                        Text(
-                            text = "🔒",
-                            fontSize = 32.sp
+                        Image(
+                            painter = painterResource(id = R.drawable.wasl_logo_mark),
+                            contentDescription = "شعار وَصْل",
+                            modifier = Modifier.fillMaxSize(),
+                            contentScale = ContentScale.Fit
                         )
                     }
                     Spacer(modifier = Modifier.height(16.dp))

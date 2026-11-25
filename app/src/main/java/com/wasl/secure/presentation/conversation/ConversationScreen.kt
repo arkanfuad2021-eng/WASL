@@ -72,7 +72,6 @@ import com.wasl.secure.domain.model.SimInfo
 import com.wasl.secure.telephony.MessageChunkManager
 import com.wasl.secure.presentation.conversation.components.MessageBubble
 import com.wasl.secure.presentation.conversation.components.MessageInputBar
-import com.wasl.secure.presentation.conversation.components.SafetyNumberDialog
 import com.wasl.secure.presentation.conversation.components.SimSelectionDialog
 import com.wasl.secure.presentation.handshake.HandshakeRejectionConfirmationDialog
 import kotlinx.coroutines.delay
@@ -85,11 +84,11 @@ fun ConversationScreen(
     messages: List<Message>,
     availableSims: List<SimInfo>,
     currentSubId: Int?,
-    ourIdentityKey: ByteArray,
-    peerIdentityKeyBase64: String?,
+    warnHighSmsParts: Boolean = true,
     isIncomingPendingHandshake: Boolean = false,
     isIncomingAcceptedHandshake: Boolean = false,
     onBackClick: () -> Unit,
+    onOpenDetails: () -> Unit = {},
     onSendMessage: (String, Int?) -> Unit,
     onSelectSim: (Int) -> Unit,
     onDeleteMessage: (String) -> Unit,
@@ -103,7 +102,6 @@ fun ConversationScreen(
     val customColors = LocalWaslColors.current
     var inputText by remember { mutableStateOf("") }
     var showSimDialog by remember { mutableStateOf(false) }
-    var showSafetyDialog by remember { mutableStateOf(false) }
     var showRejectConfirmDialog by remember { mutableStateOf(false) }
     var selectedMessageForAction by remember { mutableStateOf<Message?>(null) }
     var showHighCostSmsWarning by remember { mutableStateOf(false) }
@@ -135,7 +133,13 @@ fun ConversationScreen(
         topBar = {
             TopAppBar(
                 title = {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(10.dp))
+                            .clickable(onClick = onOpenDetails)
+                            .padding(end = 6.dp)
+                    ) {
                         // Contact Avatar
                         Box(
                             modifier = Modifier
@@ -164,7 +168,7 @@ fun ConversationScreen(
                             )
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 val (statusText, statusDotColor) = when (conversation.handshakeStatus) {
-                                    HandshakeStatus.READY -> "مشفر عبر SMS (اليمن)" to WaslEmeraldActive
+                                    HandshakeStatus.READY -> "مشفر عبر SMS" to WaslEmeraldActive
                                     HandshakeStatus.KEY_CHANGED_ALERT -> "⚠️ تغيرت الهوية الرقمية" to MaterialTheme.colorScheme.error
                                     HandshakeStatus.REJECTED -> "تم رفض طلب المصافحة" to WaslRoseReject
                                     HandshakeStatus.PENDING_CONFIRM_SEND -> "جاري تأكيد التشفير..." to WaslAmberPending
@@ -197,27 +201,8 @@ fun ConversationScreen(
                     }
                 },
                 actions = {
-                    // Active SIM Indicator badge (Clickable to switch SIMs if multi-SIM)
-                    if (availableSims.size > 1) {
-                        val activeSimName = availableSims.find { it.subscriptionId == currentSubId }?.displayName ?: "SIM 1"
-                        Box(
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(8.dp))
-                                .background(customColors.sentBubble.copy(alpha = 0.1f))
-                                .clickable { showSimDialog = true }
-                                .padding(horizontal = 8.dp, vertical = 4.dp)
-                        ) {
-                            Text(
-                                text = activeSimName,
-                                style = MaterialTheme.typography.labelSmall,
-                                color = customColors.sentBubble,
-                                fontSize = 11.sp
-                            )
-                        }
-                    }
-
-                    // Safety Number / Verification Dialog button
-                    IconButton(onClick = { showSafetyDialog = true }) {
+                    // Conversation & Security Details screen button
+                    IconButton(onClick = onOpenDetails) {
                         Icon(
                             imageVector = Icons.Default.Info,
                             contentDescription = "Security Info",
@@ -238,7 +223,7 @@ fun ConversationScreen(
                     onSendClick = {
                         val estimatedParts = MessageChunkManager.estimateEncryptedSmsParts(inputText)
 
-                        if (estimatedParts > 10) {
+                        if (warnHighSmsParts && estimatedParts > 10) {
                             showHighCostSmsWarning = true
                         } else {
                             onSendMessage(inputText, currentSubId)
@@ -474,16 +459,6 @@ fun ConversationScreen(
                 onRejectHandshake()
             },
             onDismiss = { showRejectConfirmDialog = false }
-        )
-    }
-
-    // Safety Number Verification Dialog
-    if (showSafetyDialog) {
-        SafetyNumberDialog(
-            contactName = conversation.contactName,
-            ourIdentityKey = ourIdentityKey,
-            peerIdentityKeyBase64 = peerIdentityKeyBase64,
-            onDismiss = { showSafetyDialog = false }
         )
     }
 
