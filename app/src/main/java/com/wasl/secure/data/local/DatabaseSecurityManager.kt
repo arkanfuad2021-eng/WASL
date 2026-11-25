@@ -7,6 +7,7 @@ import com.wasl.secure.core.crypto.KeystoreManager
 import net.sqlcipher.database.SQLiteDatabase
 import java.io.File
 import java.security.SecureRandom
+import java.util.Locale
 
 /**
  * Manages the Database Encryption Key (DEK) lifecycle, envelope encryption,
@@ -122,37 +123,45 @@ class DatabaseSecurityManager(
 
         try {
             // Step 1: Open legacy database
-            legacyDb = SQLiteDatabase.openDatabase(
+            val openedLegacyDb = SQLiteDatabase.openDatabase(
                 legacyDbFile.absolutePath,
                 legacyPassphrase,
                 null,
-                SQLiteDatabase.OPEN_READWRITE
+                SQLiteDatabase.OPEN_READWRITE,
+                null,
+                null
             )
+            legacyDb = openedLegacyDb
 
             // Step 2: Checkpoint WAL into the main file to avoid missing pending transactions
-            legacyDb.rawExecSQL("PRAGMA wal_checkpoint(TRUNCATE);")
+            openedLegacyDb.rawExecSQL("PRAGMA wal_checkpoint(TRUNCATE);")
 
-            // Step 3: Attach migrating database with the new DEK
-            val newDekHex = newDek.joinToString("") { "%02x".format(it) }
-            legacyDb.rawExecSQL("ATTACH DATABASE '${migratingDbFile.absolutePath}' AS new_db KEY \"x'$newDekHex'\";")
+            // Step 3: Attach migrating database with the new 32-byte DEK as a SQLite BLOB literal (X'...')
+            // so ATTACH passes the exact same 32 binary bytes into sqlite3_key / PBKDF2 as SupportFactory(newDek).
+            val escapedMigratingPath = migratingDbFile.absolutePath.replace("'", "''")
+            val newDekHex = newDek.joinToString("") { "%02x".format(Locale.US, it) }
+            openedLegacyDb.rawExecSQL("ATTACH DATABASE '$escapedMigratingPath' AS new_db KEY X'$newDekHex';")
 
             // Step 4: Export complete schema, indexes, and rows
-            legacyDb.rawExecSQL("SELECT sqlcipher_export('new_db');")
+            openedLegacyDb.rawExecSQL("SELECT sqlcipher_export('new_db');")
 
             // Step 5: Detach and close legacy DB cleanly
-            legacyDb.rawExecSQL("DETACH DATABASE new_db;")
-            legacyDb.close()
+            openedLegacyDb.rawExecSQL("DETACH DATABASE new_db;")
+            openedLegacyDb.close()
             legacyDb = null
 
-            // Step 6: Verify new database integrity and tables
-            migratedDb = SQLiteDatabase.openDatabase(
+            // Step 6: Verify new database integrity and tables by reopening with raw 32-byte newDek
+            val openedMigratedDb = SQLiteDatabase.openDatabase(
                 migratingDbFile.absolutePath,
                 newDek,
                 null,
-                SQLiteDatabase.OPEN_READONLY
+                SQLiteDatabase.OPEN_READONLY,
+                null,
+                null
             )
+            migratedDb = openedMigratedDb
 
-            val integrityCursor = migratedDb.rawQuery("PRAGMA integrity_check;", null)
+            val integrityCursor = openedMigratedDb.rawQuery("PRAGMA integrity_check;", null)
             var integrityOk = false
             if (integrityCursor.moveToFirst()) {
                 val result = integrityCursor.getString(0)
@@ -165,14 +174,14 @@ class DatabaseSecurityManager(
             }
 
             // Step 7: Verify schema existence
-            val tablesCursor = migratedDb.rawQuery("SELECT name FROM sqlite_master WHERE type='table';", null)
+            val tablesCursor = openedMigratedDb.rawQuery("SELECT name FROM sqlite_master WHERE type='table';", null)
             val existingTables = mutableSetOf<String>()
             while (tablesCursor.moveToNext()) {
                 existingTables.add(tablesCursor.getString(0))
             }
             tablesCursor.close()
 
-            migratedDb.close()
+            openedMigratedDb.close()
             migratedDb = null
 
             // Step 8: Atomic File Replacement
@@ -207,6 +216,7 @@ class DatabaseSecurityManager(
         } catch (e: Exception) {
             legacyDb?.close()
             migratedDb?.close()
+            newDek.fill(0)
             if (migratingDbFile.exists()) {
                 migratingDbFile.delete()
             }
