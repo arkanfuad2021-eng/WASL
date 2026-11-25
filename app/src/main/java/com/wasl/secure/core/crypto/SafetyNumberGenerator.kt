@@ -29,11 +29,33 @@ object SafetyNumberGenerator {
 
         // 3. Extract 3 numerical chunks (each 4 digits: 0000 - 9999) from hash bytes
         val buffer = ByteBuffer.wrap(hash)
-        val chunk1 = (Math.abs(buffer.getInt(0)) % 10000).toString().padStart(4, '0')
-        val chunk2 = (Math.abs(buffer.getInt(4)) % 10000).toString().padStart(4, '0')
-        val chunk3 = (Math.abs(buffer.getInt(8)) % 10000).toString().padStart(4, '0')
+        val chunk1 = ((buffer.getInt(0) and 0x7FFFFFFF) % 10000).toString().padStart(4, '0')
+        val chunk2 = ((buffer.getInt(4) and 0x7FFFFFFF) % 10000).toString().padStart(4, '0')
+        val chunk3 = ((buffer.getInt(8) and 0x7FFFFFFF) % 10000).toString().padStart(4, '0')
 
         return "$chunk1 - $chunk2 - $chunk3"
+    }
+
+    fun generateQrPayload(ourKey: ByteArray, peerKey: ByteArray): String {
+        val b64 = java.util.Base64.getUrlEncoder().withoutPadding()
+        val ourB64 = b64.encodeToString(ourKey)
+        val peerB64 = b64.encodeToString(peerKey)
+        return "WASL:V1:SAFETY:$ourB64:$peerB64"
+    }
+
+    fun parseAndVerifyQrPayload(qrContent: String, expectedOurKey: ByteArray, expectedPeerKey: ByteArray): Boolean {
+        return try {
+            val parts = qrContent.trim().split(":")
+            if (parts.size != 5 || parts[0] != "WASL" || parts[1] != "V1" || parts[2] != "SAFETY") return false
+            val b64 = java.util.Base64.getUrlDecoder()
+            val scannedKey1 = b64.decode(parts[3])
+            val scannedKey2 = b64.decode(parts[4])
+            // On the peer's phone, key1 is peer's identity key, key2 is our identity key
+            (scannedKey1.contentEquals(expectedPeerKey) && scannedKey2.contentEquals(expectedOurKey)) ||
+                    (scannedKey1.contentEquals(expectedOurKey) && scannedKey2.contentEquals(expectedPeerKey))
+        } catch (e: Exception) {
+            false
+        }
     }
 
     private fun compareByteArrays(a: ByteArray, b: ByteArray): Int {

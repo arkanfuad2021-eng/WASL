@@ -27,6 +27,7 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
+import java.nio.ByteBuffer
 import java.security.GeneralSecurityException
 
 /**
@@ -34,6 +35,33 @@ import java.security.GeneralSecurityException
  * explicitly defined in Section 20 of the WASL Master Specification.
  */
 class Phase8MasterAcceptanceTestSuite {
+
+    private fun buildInitSignData(reqId: String, ik: ByteArray, ek: ByteArray, ts: Long): ByteArray {
+        val domain = "WASL1:INIT:v1:".toByteArray(Charsets.UTF_8)
+        val req = reqId.toByteArray(Charsets.UTF_8)
+        return ByteBuffer.allocate(domain.size + 2 + req.size + 32 + 32 + 8)
+            .put(domain).putShort(req.size.toShort()).put(req).put(ik).put(ek).putLong(ts).array()
+    }
+
+    private fun buildRespSignData(
+        reqId: String,
+        respIk: ByteArray,
+        respEk: ByteArray,
+        initIk: ByteArray,
+        initEk: ByteArray
+    ): ByteArray {
+        val domain = "WASL1:RESP:v1:".toByteArray(Charsets.UTF_8)
+        val req = reqId.toByteArray(Charsets.UTF_8)
+        return ByteBuffer.allocate(domain.size + 2 + req.size + 32 + 32 + 32 + 32)
+            .put(domain).putShort(req.size.toShort()).put(req).put(respIk).put(respEk).put(initIk).put(initEk).array()
+    }
+
+    private fun buildRejectSignData(reqId: String, rejectorIk: ByteArray, ts: Long): ByteArray {
+        val domain = "WASL1:REJ:v1:".toByteArray(Charsets.UTF_8)
+        val req = reqId.toByteArray(Charsets.UTF_8)
+        return ByteBuffer.allocate(domain.size + 2 + req.size + 32 + 8)
+            .put(domain).putShort(req.size.toShort()).put(req).put(rejectorIk).putLong(ts).array()
+    }
 
     // =========================================================================
     // اختبار 1: تأسيس محادثة جديدة (Handshake 3-Way Completion)
@@ -43,19 +71,32 @@ class Phase8MasterAcceptanceTestSuite {
         val aliceIdentity = Curve25519Engine.generateEd25519KeyPair()
         val bobIdentity = Curve25519Engine.generateEd25519KeyPair()
 
-        // Alice sends INIT
-        val reqId = "W100"
+        // Alice sends INIT using canonical domain-separated signature
+        val reqId = "W100AA"
+        val ts = System.currentTimeMillis()
         val aliceEphemeral = Curve25519Engine.generateX25519KeyPair()
-        val initSig = Curve25519Engine.signEd25519(aliceIdentity.privateKey, reqId.toByteArray() + aliceEphemeral.publicKey)
-        val initPacket = HandshakePacket.Init(reqId, aliceIdentity.publicKey, aliceEphemeral.publicKey, System.currentTimeMillis(), initSig)
+        val initSig = Curve25519Engine.signEd25519(
+            aliceIdentity.privateKey,
+            buildInitSignData(reqId, aliceIdentity.publicKey, aliceEphemeral.publicKey, ts)
+        )
+        val initPacket = HandshakePacket.Init(reqId, aliceIdentity.publicKey, aliceEphemeral.publicKey, ts, initSig)
         val smsInit = HandshakePacketCodec.encode(initPacket)
 
-        // Bob verifies INIT and sends RESPONSE
+        // Bob verifies INIT and sends canonical signed RESPONSE
         val parsedInit = HandshakePacketCodec.decode(smsInit) as HandshakePacket.Init
-        assertTrue(Curve25519Engine.verifyEd25519(parsedInit.identityPublicKey, reqId.toByteArray() + parsedInit.ephemeralPublicKey, parsedInit.signature))
+        assertTrue(
+            Curve25519Engine.verifyEd25519(
+                parsedInit.identityPublicKey,
+                buildInitSignData(parsedInit.requestId, parsedInit.identityPublicKey, parsedInit.ephemeralPublicKey, parsedInit.timestamp),
+                parsedInit.signature
+            )
+        )
 
         val bobEphemeral = Curve25519Engine.generateX25519KeyPair()
-        val respSig = Curve25519Engine.signEd25519(bobIdentity.privateKey, reqId.toByteArray() + bobEphemeral.publicKey + parsedInit.ephemeralPublicKey)
+        val respSig = Curve25519Engine.signEd25519(
+            bobIdentity.privateKey,
+            buildRespSignData(reqId, bobIdentity.publicKey, bobEphemeral.publicKey, parsedInit.identityPublicKey, parsedInit.ephemeralPublicKey)
+        )
         val respPacket = HandshakePacket.Response(reqId, bobIdentity.publicKey, bobEphemeral.publicKey, respSig)
         val smsResp = HandshakePacketCodec.encode(respPacket)
 
@@ -63,9 +104,15 @@ class Phase8MasterAcceptanceTestSuite {
         val bobSecret = Curve25519Engine.computeSharedSecret(bobEphemeral.privateKey, parsedInit.ephemeralPublicKey)
         val bobKeys = DirectionalKeyDerivation.deriveForResponder(bobSecret)
 
-        // Alice receives RESPONSE, verifies, and sends CONFIRM
+        // Alice receives RESPONSE, verifies canonical signature bound to both keys, and sends CONFIRM
         val parsedResp = HandshakePacketCodec.decode(smsResp) as HandshakePacket.Response
-        assertTrue(Curve25519Engine.verifyEd25519(parsedResp.identityPublicKey, reqId.toByteArray() + parsedResp.ephemeralPublicKey + aliceEphemeral.publicKey, parsedResp.signature))
+        assertTrue(
+            Curve25519Engine.verifyEd25519(
+                parsedResp.identityPublicKey,
+                buildRespSignData(reqId, parsedResp.identityPublicKey, parsedResp.ephemeralPublicKey, aliceIdentity.publicKey, aliceEphemeral.publicKey),
+                parsedResp.signature
+            )
+        )
 
         val aliceSecret = Curve25519Engine.computeSharedSecret(aliceEphemeral.privateKey, parsedResp.ephemeralPublicKey)
         val aliceKeys = DirectionalKeyDerivation.deriveForInitiator(aliceSecret)
@@ -85,33 +132,45 @@ class Phase8MasterAcceptanceTestSuite {
     }
 
     // =========================================================================
-    // اختبار 2: تأكيد الرفض (Rejection Confirmation)
+    // اختبار 2: ترميز حزمة الرفض (REJECT) وفكها والتحقق من توقيع Ed25519
+    // ملاحظة: هذا الاختبار يغطي البروتوكول والتوقيع فقط؛ نافذة تأكيد المستخدم تتبع طبقة الواجهة.
     // =========================================================================
     @Test
-    fun test_02_rejection_requires_confirmation() {
-        var rejectionConfirmed = false
-        var rejectPacketSent = false
+    fun test_02_reject_packet_codec_and_signature_verification() {
+        val bobIdentity = Curve25519Engine.generateEd25519KeyPair()
+        val ts = System.currentTimeMillis()
+        val reqId = "W100REJ"
+        val sig = Curve25519Engine.signEd25519(
+            bobIdentity.privateKey,
+            buildRejectSignData(reqId, bobIdentity.publicKey, ts)
+        )
+        val packet = HandshakePacket.Reject(reqId, ts, bobIdentity.publicKey, sig)
+        val sms = HandshakePacketCodec.encode(packet)
+        assertTrue("Encoded REJECT packet must use WASL1:REJ header", sms.startsWith("WASL1:REJ:$reqId:$ts:"))
 
-        fun onRejectClicked(confirmed: Boolean) {
-            if (confirmed) {
-                rejectionConfirmed = true
-                val packet = HandshakePacket.Reject("W100")
-                val sms = HandshakePacketCodec.encode(packet)
-                if (sms.startsWith("WASL1:REJ:")) {
-                    rejectPacketSent = true
-                }
-            }
-        }
+        val decoded = HandshakePacketCodec.decode(sms) as? HandshakePacket.Reject
+        assertNotNull("Decoded packet must be HandshakePacket.Reject", decoded)
+        assertEquals(reqId, decoded!!.requestId)
+        assertEquals(ts, decoded.timestamp)
+        assertArrayEquals(bobIdentity.publicKey, decoded.identityPublicKey)
+        assertArrayEquals(sig, decoded.signature)
 
-        // Clicking Reject without confirmation must NOT execute
-        onRejectClicked(confirmed = false)
-        assertFalse(rejectionConfirmed)
-        assertFalse(rejectPacketSent)
-
-        // Confirming rejection executes
-        onRejectClicked(confirmed = true)
-        assertTrue(rejectionConfirmed)
-        assertTrue(rejectPacketSent)
+        assertTrue(
+            "Ed25519 signature of decoded REJECT packet must verify",
+            Curve25519Engine.verifyEd25519(
+                decoded.identityPublicKey,
+                buildRejectSignData(decoded.requestId, decoded.identityPublicKey, decoded.timestamp),
+                decoded.signature
+            )
+        )
+        assertFalse(
+            "Tampered REJECT timestamp must fail Ed25519 verification",
+            Curve25519Engine.verifyEd25519(
+                decoded.identityPublicKey,
+                buildRejectSignData(decoded.requestId, decoded.identityPublicKey, decoded.timestamp + 1L),
+                decoded.signature
+            )
+        )
     }
 
     // =========================================================================
@@ -137,11 +196,23 @@ class Phase8MasterAcceptanceTestSuite {
     }
 
     // =========================================================================
-    // اختبار 4: رد متأخر لا يؤثر على الطلب الجديد
+    // اختبار 4: حارس تطابق المعرّف ومنع الانتقال من REJECTED
+    // ملاحظة: يقتصر هذا الاختبار على فحص مطابقة المعرّف وحارس آلة الحالات فقط؛
+    // اختبار الرفض الفعلي للردود المتأخرة والطلبات المستبدلة عبر HandshakeManager مؤجّل للخطوة الثانية.
     // =========================================================================
     @Test
-    fun test_04_stale_response_ignored() {
+    fun test_04_request_id_mismatch_and_rejected_state_guard() {
         val activeRequestId = "W205" // New active request
+        val activeConversation = Conversation(
+            id = "0123456789abcdef",
+            contactName = "محمد",
+            phoneNumber = "+967771234567",
+            lastMessage = null,
+            lastMessageTimestamp = System.currentTimeMillis(),
+            handshakeStatus = HandshakeStatus.REJECTED,
+            rejectedAt = System.currentTimeMillis(),
+            currentRequestId = activeRequestId
+        )
         val staleResponsePacket = HandshakePacket.Response(
             requestId = "W100", // Old rejected request
             identityPublicKey = ByteArray(32),
@@ -149,9 +220,12 @@ class Phase8MasterAcceptanceTestSuite {
             signature = ByteArray(64)
         )
 
-        // Protocol rule: Must reject response whose ID != activeRequestId
-        val isAccepted = staleResponsePacket.requestId == activeRequestId
-        assertFalse("Stale response for previous request must be dropped", isAccepted)
+        // Scope: unit check of requestId equality and HandshakeStateMachine transition guard only.
+        // Full HandshakeManager/HandshakeDao delayed-response rejection behavior is covered in Step 2.
+        val idMatches = staleResponsePacket.requestId == activeConversation.currentRequestId
+        val transitionAllowed = HandshakeStateMachine.canTransition(activeConversation.handshakeStatus, HandshakeStatus.PENDING_CONFIRM_SEND)
+        assertFalse("Response with mismatched requestId must not match activeRequestId", idMatches)
+        assertFalse("HandshakeStateMachine must disallow REJECTED -> PENDING_CONFIRM_SEND on RESPONSE", transitionAllowed)
     }
 
     // =========================================================================
@@ -173,19 +247,23 @@ class Phase8MasterAcceptanceTestSuite {
     fun test_06_encrypted_message_storage_separation() {
         val plainText = "رسالة سرية موثقة"
         val key = ByteArray(32) { 0x11.toByte() }
-        val nonce = ByteArray(12) { 0x22.toByte() }
-        val aad = "conv:msg:1:1/1".toByteArray()
+        val nonce = MonotonicNonceManager().createNonceForCounter(1L)
+        val convId = "0123456789abcdef"
+        val msgId = "fedcba9876543210"
+        val aad = "$convId:$msgId:1:1/1".toByteArray()
 
         val encrypted = AesGcmCipher.encrypt(key, nonce, plainText.toByteArray(), aad)
-        val packet = ChatMessagePacket("conv", "msg", 1, 1, 1, nonce, encrypted.ciphertextWithTag)
+        val packet = ChatMessagePacket(convId, msgId, 1, 1, 1, nonce, encrypted.ciphertextWithTag)
         val rawSmsString = ChatMessageCodec.encode(packet)
 
         // In System Stock SMS App: Raw encrypted Base64 string appears
-        assertTrue(rawSmsString.startsWith("WASL1:MSG:"))
+        assertTrue(rawSmsString.startsWith("WASL1:MSG:$convId:$msgId:0001:1/1:"))
         assertFalse("Original plaintext must not be visible in raw SMS string", rawSmsString.contains(plainText))
 
-        // In WASL App: Plaintext is decrypted and displayed
-        val decrypted = AesGcmCipher.decrypt(key, nonce, packet.ciphertextWithTag, aad)
+        // In WASL App: Packet decodes strictly and decrypts to plaintext
+        val decoded = ChatMessageCodec.decode(rawSmsString)
+        assertNotNull("Valid 16-hex encoded packet must decode cleanly", decoded)
+        val decrypted = AesGcmCipher.decrypt(key, decoded!!.nonce, decoded.ciphertextWithTag, decoded.getAad())
         assertEquals(plainText, String(decrypted))
     }
 
@@ -207,16 +285,29 @@ class Phase8MasterAcceptanceTestSuite {
         val longText = "نص طويل مكرر لاختبار التجزئة ".repeat(15)
         val key = ByteArray(32) { 0x44.toByte() }
         val nonce = ByteArray(12) { 0x55.toByte() }
-        val aad = "c:m:1:1/4".toByteArray()
+        val convId = "0123456789abcdef"
+        val msgId = "fedcba9876543210"
+        val aad = "$convId:$msgId:1:1/4".toByteArray()
 
         val encrypted = AesGcmCipher.encrypt(key, nonce, longText.toByteArray(), aad)
-        val packets = MessageChunkManager.fragmentCiphertext("c", "m", 1, nonce, encrypted.ciphertextWithTag)
+        val packets = MessageChunkManager.fragmentCiphertext(
+            conversationId = convId,
+            messageId = msgId,
+            attemptId = "0001",
+            sequenceNumber = 1L,
+            nonce = nonce,
+            ciphertextWithTag = encrypted.ciphertextWithTag
+        )
 
         assertTrue(packets.size > 1)
-        val assignedSimId = 2 // SIM 2 chosen
+        val conv = Conversation(convId, "محمد", "+967771234567", null, 0L, defaultSubscriptionId = 2)
+        val assignedSimId = conv.defaultSubscriptionId ?: 1
 
-        // All chunks must retain the same assigned SIM
-        packets.forEach {
+        // All chunks must bind to the exact same parent message, attempt, and assigned SIM
+        packets.forEach { pkt ->
+            assertEquals(convId, pkt.conversationId)
+            assertEquals(msgId, pkt.messageId)
+            assertEquals("0001", pkt.attemptId)
             assertEquals("Every chunk must be dispatched on SIM $assignedSimId", 2, assignedSimId)
         }
     }
@@ -265,6 +356,9 @@ class Phase8MasterAcceptanceTestSuite {
 
         val warningMessage = if (hasIdentityChanged) "⚠️ تحذير أمني: تغيرت الهوية التشفيرية لهذا الرقم!" else ""
         assertTrue(warningMessage.contains("تحذير أمني"))
+        assertTrue(HandshakeStateMachine.canTransition(HandshakeStatus.READY, HandshakeStatus.KEY_CHANGED_ALERT))
+        assertFalse("KEY_CHANGED_ALERT lockdown must never auto-revert to READY",
+            HandshakeStateMachine.canTransition(HandshakeStatus.KEY_CHANGED_ALERT, HandshakeStatus.READY))
     }
 
     // =========================================================================

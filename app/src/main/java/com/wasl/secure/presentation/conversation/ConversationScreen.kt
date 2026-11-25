@@ -60,15 +60,23 @@ import androidx.compose.ui.unit.sp
 import com.wasl.secure.R
 import com.wasl.secure.core.theme.LocalWaslColors
 import com.wasl.secure.core.theme.ThmanyahBlack
+import com.wasl.secure.core.theme.WaslAmberPending
 import com.wasl.secure.core.theme.WaslEmeraldActive
+import com.wasl.secure.core.theme.WaslRoseReject
 import com.wasl.secure.domain.model.Conversation
 import com.wasl.secure.domain.model.HandshakeStatus
 import com.wasl.secure.domain.model.Message
+import com.wasl.secure.domain.model.MessageDirection
+import com.wasl.secure.domain.model.MessageStatus
 import com.wasl.secure.domain.model.SimInfo
+import com.wasl.secure.telephony.MessageChunkManager
 import com.wasl.secure.presentation.conversation.components.MessageBubble
 import com.wasl.secure.presentation.conversation.components.MessageInputBar
 import com.wasl.secure.presentation.conversation.components.SafetyNumberDialog
 import com.wasl.secure.presentation.conversation.components.SimSelectionDialog
+import com.wasl.secure.presentation.handshake.HandshakeRejectionConfirmationDialog
+import kotlinx.coroutines.delay
+import java.util.Locale
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -79,21 +87,40 @@ fun ConversationScreen(
     currentSubId: Int?,
     ourIdentityKey: ByteArray,
     peerIdentityKeyBase64: String?,
+    isIncomingPendingHandshake: Boolean = false,
+    isIncomingAcceptedHandshake: Boolean = false,
     onBackClick: () -> Unit,
     onSendMessage: (String, Int?) -> Unit,
     onSelectSim: (Int) -> Unit,
     onDeleteMessage: (String) -> Unit,
     onInitiateHandshake: () -> Unit,
     onAcceptHandshake: () -> Unit,
-    onRejectHandshake: () -> Unit
+    onRejectHandshake: () -> Unit,
+    onResendConfirm: () -> Unit = {},
+    onResendMessage: (String) -> Unit = {}
 ) {
     val context = LocalContext.current
     val customColors = LocalWaslColors.current
     var inputText by remember { mutableStateOf("") }
     var showSimDialog by remember { mutableStateOf(false) }
     var showSafetyDialog by remember { mutableStateOf(false) }
+    var showRejectConfirmDialog by remember { mutableStateOf(false) }
     var selectedMessageForAction by remember { mutableStateOf<Message?>(null) }
     var showHighCostSmsWarning by remember { mutableStateOf(false) }
+
+    var remainingCooldown by remember(conversation.rejectedAt, conversation.handshakeStatus) {
+        mutableStateOf(conversation.remainingCooldownSeconds())
+    }
+
+    LaunchedEffect(conversation.rejectedAt, conversation.handshakeStatus) {
+        remainingCooldown = conversation.remainingCooldownSeconds()
+        if (conversation.handshakeStatus == HandshakeStatus.REJECTED) {
+            while (remainingCooldown > 0) {
+                delay(1000L)
+                remainingCooldown = conversation.remainingCooldownSeconds()
+            }
+        }
+    }
 
     val listState = rememberLazyListState()
 
@@ -136,8 +163,13 @@ fun ConversationScreen(
                                 color = customColors.textPrimary
                             )
                             Row(verticalAlignment = Alignment.CenterVertically) {
-                                val isEncryptedReady = conversation.handshakeStatus == HandshakeStatus.READY
-                                val statusDotColor = if (isEncryptedReady) WaslEmeraldActive else MaterialTheme.colorScheme.tertiary
+                                val (statusText, statusDotColor) = when (conversation.handshakeStatus) {
+                                    HandshakeStatus.READY -> "مشفر عبر SMS (اليمن)" to WaslEmeraldActive
+                                    HandshakeStatus.KEY_CHANGED_ALERT -> "⚠️ تغيرت الهوية الرقمية" to MaterialTheme.colorScheme.error
+                                    HandshakeStatus.REJECTED -> "تم رفض طلب المصافحة" to WaslRoseReject
+                                    HandshakeStatus.PENDING_CONFIRM_SEND -> "جاري تأكيد التشفير..." to WaslAmberPending
+                                    else -> "في انتظار تأسيس المفاتيح" to WaslAmberPending
+                                }
                                 Box(
                                     modifier = Modifier
                                         .size(6.dp)
@@ -146,7 +178,7 @@ fun ConversationScreen(
                                 )
                                 Spacer(modifier = Modifier.width(4.dp))
                                 Text(
-                                    text = if (isEncryptedReady) "مشفر عبر SMS (اليمن)" else "في انتظار تأسيس المفاتيح",
+                                    text = statusText,
                                     style = MaterialTheme.typography.labelSmall,
                                     color = statusDotColor,
                                     fontSize = 10.sp
@@ -204,10 +236,7 @@ fun ConversationScreen(
                     text = inputText,
                     onTextChanged = { inputText = it },
                     onSendClick = {
-                        val plainBytes = inputText.toByteArray(Charsets.UTF_8).size
-                        val totalCipherBytes = plainBytes + 16 + 12 + 26
-                        val base64Length = ((totalCipherBytes + 2) / 3) * 4
-                        val estimatedParts = (base64Length + 129) / 130
+                        val estimatedParts = MessageChunkManager.estimateEncryptedSmsParts(inputText)
 
                         if (estimatedParts > 10) {
                             showHighCostSmsWarning = true
@@ -240,41 +269,128 @@ fun ConversationScreen(
                 ) {
                     when (conversation.handshakeStatus) {
                         HandshakeStatus.WAITING -> {
-                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                Text(
-                                    text = "⏳ في انتظار اكتمال المصافحة وتبادل المفاتيح مع الطرف الآخر...",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = customColors.textSecondary
-                                )
-                                Spacer(modifier = Modifier.height(10.dp))
-                                Row {
-                                    Button(
+                            if (isIncomingPendingHandshake) {
+                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                    Text(
+                                        text = "📩 طلب تأسيس محادثة مشفرة وارد من ${conversation.contactName}",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = customColors.textSecondary
+                                    )
+                                    Spacer(modifier = Modifier.height(10.dp))
+                                    Row {
+                                        Button(
+                                            onClick = onAcceptHandshake,
+                                            colors = ButtonDefaults.buttonColors(containerColor = customColors.sentBubble),
+                                            shape = RoundedCornerShape(10.dp)
+                                        ) {
+                                            Text("قبول وتبادل المفاتيح")
+                                        }
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        OutlinedButton(
+                                            onClick = { showRejectConfirmDialog = true },
+                                            shape = RoundedCornerShape(10.dp)
+                                        ) {
+                                            Text("رفض الطلب", color = MaterialTheme.colorScheme.error)
+                                        }
+                                    }
+                                }
+                            } else if (isIncomingAcceptedHandshake) {
+                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                    Text(
+                                        text = "⏳ تم قبول الطلب وإرسال الرد، بانتظار تأكيد الطرف الآخر...",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = customColors.textSecondary
+                                    )
+                                    Spacer(modifier = Modifier.height(8.dp))
+                                    OutlinedButton(
                                         onClick = onAcceptHandshake,
-                                        colors = ButtonDefaults.buttonColors(containerColor = customColors.sentBubble),
                                         shape = RoundedCornerShape(10.dp)
                                     ) {
-                                        Text("قبول وتبادل المفاتيح")
+                                        Text("إعادة إرسال الرد", color = customColors.textPrimary)
                                     }
+                                }
+                            } else if (conversation.currentRequestId == null) {
+                                // Handle legacy NEW conversations previously stored as WAITING without an active requestId
+                                Button(
+                                    onClick = onInitiateHandshake,
+                                    colors = ButtonDefaults.buttonColors(containerColor = customColors.sentBubble),
+                                    shape = RoundedCornerShape(12.dp),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Icon(Icons.Default.Lock, contentDescription = null, modifier = Modifier.size(18.dp))
                                     Spacer(modifier = Modifier.width(8.dp))
+                                    Text("إرسال طلب مصافحة مشفرة (Handshake SMS)")
+                                }
+                            } else {
+                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                    Text(
+                                        text = "⏳ تم إرسال طلب المصافحة، بانتظار موافقة الطرف الآخر...",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = customColors.textSecondary
+                                    )
+                                    Spacer(modifier = Modifier.height(8.dp))
                                     OutlinedButton(
                                         onClick = onInitiateHandshake,
                                         shape = RoundedCornerShape(10.dp)
                                     ) {
-                                        Text("إرسال طلب تأسيس", color = customColors.textPrimary)
+                                        Text("إعادة إرسال الطلب", color = customColors.textPrimary)
                                     }
                                 }
                             }
                         }
-                        HandshakeStatus.REJECTED -> {
+                        HandshakeStatus.PENDING_CONFIRM_SEND -> {
                             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                                 Text(
-                                    text = "تم رفض طلب الاتصال المشفر سابقاً.",
+                                    text = "⏳ جاري إرسال تأكيد المصافحة (CONFIRM)...",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = customColors.textSecondary
+                                )
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Button(
+                                    onClick = onResendConfirm,
+                                    colors = ButtonDefaults.buttonColors(containerColor = customColors.sentBubble),
+                                    shape = RoundedCornerShape(10.dp)
+                                ) {
+                                    Text("إعادة إرسال التأكيد")
+                                }
+                            }
+                        }
+                        HandshakeStatus.KEY_CHANGED_ALERT -> {
+                            Column(
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                modifier = Modifier.padding(8.dp)
+                            ) {
+                                Text(
+                                    text = "⚠️ تحذير أمني خطير: تغيرت الهوية الرقمية للطرف الآخر!\nتم إيقاف وحظر إرسال الرسائل لحمايتك من التجسس.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.error,
+                                    textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                                )
+                            }
+                        }
+                        HandshakeStatus.REJECTED -> {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                val rejectInfoText = if (remainingCooldown > 0) {
+                                    val minutes = remainingCooldown / 60
+                                    val seconds = remainingCooldown % 60
+                                    String.format(
+                                        Locale.getDefault(),
+                                        "تم رفض الطلب. يمكنك إرسال طلب جديد بعد %02d:%02d",
+                                        minutes,
+                                        seconds
+                                    )
+                                } else {
+                                    "تم رفض طلب الاتصال المشفر سابقاً. يمكنك إرسال طلب جديد الآن."
+                                }
+                                Text(
+                                    text = rejectInfoText,
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.error
                                 )
                                 Spacer(modifier = Modifier.height(8.dp))
                                 Button(
                                     onClick = onInitiateHandshake,
+                                    enabled = remainingCooldown == 0L,
                                     colors = ButtonDefaults.buttonColors(containerColor = customColors.sentBubble),
                                     shape = RoundedCornerShape(10.dp)
                                 ) {
@@ -347,6 +463,18 @@ fun ConversationScreen(
                 }
             }
         }
+    }
+
+    // Handshake Rejection Confirmation Dialog (Incoming requests only)
+    if (showRejectConfirmDialog && isIncomingPendingHandshake) {
+        HandshakeRejectionConfirmationDialog(
+            contactName = conversation.contactName,
+            onConfirmReject = {
+                showRejectConfirmDialog = false
+                onRejectHandshake()
+            },
+            onDismiss = { showRejectConfirmDialog = false }
+        )
     }
 
     // Safety Number Verification Dialog
@@ -426,34 +554,53 @@ fun ConversationScreen(
                 }
             },
             confirmButton = {
-                Row {
-                    TextButton(
-                        onClick = {
-                            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                            val clip = ClipData.newPlainText("Decrypted WASL Message", message.content)
-                            clipboard.setPrimaryClip(clip)
-                            Toast.makeText(context, "تم نسخ النص المفكوك", Toast.LENGTH_SHORT).show()
-                            selectedMessageForAction = null
+                val canResend = message.direction == MessageDirection.OUTGOING &&
+                        message.status == MessageStatus.FAILED &&
+                        conversation.handshakeStatus == HandshakeStatus.READY
+                Column(horizontalAlignment = Alignment.End) {
+                    if (canResend) {
+                        TextButton(
+                            onClick = {
+                                onResendMessage(message.id)
+                                selectedMessageForAction = null
+                            }
+                        ) {
+                            Text(
+                                text = "إعادة الإرسال",
+                                color = customColors.sentBubble,
+                                style = MaterialTheme.typography.labelLarge
+                            )
                         }
-                    ) {
-                        Text(
-                            text = "نسخ النص",
-                            color = customColors.sentBubble,
-                            style = MaterialTheme.typography.labelLarge
-                        )
                     }
-
-                    TextButton(
-                        onClick = {
-                            onDeleteMessage(message.id)
-                            selectedMessageForAction = null
+                    Row {
+                        TextButton(
+                            onClick = {
+                                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                val clip = ClipData.newPlainText("Decrypted WASL Message", message.content)
+                                clipboard.setPrimaryClip(clip)
+                                Toast.makeText(context, "تم نسخ النص المفكوك", Toast.LENGTH_SHORT).show()
+                                selectedMessageForAction = null
+                            }
+                        ) {
+                            Text(
+                                text = "نسخ النص",
+                                color = customColors.sentBubble,
+                                style = MaterialTheme.typography.labelLarge
+                            )
                         }
-                    ) {
-                        Text(
-                            text = "مسح محلياً",
-                            color = MaterialTheme.colorScheme.error,
-                            style = MaterialTheme.typography.labelLarge
-                        )
+
+                        TextButton(
+                            onClick = {
+                                onDeleteMessage(message.id)
+                                selectedMessageForAction = null
+                            }
+                        ) {
+                            Text(
+                                text = "مسح محلياً",
+                                color = MaterialTheme.colorScheme.error,
+                                style = MaterialTheme.typography.labelLarge
+                            )
+                        }
                     }
                 }
             },

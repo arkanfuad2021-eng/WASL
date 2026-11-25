@@ -16,6 +16,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Before
 import org.junit.Test
+import java.nio.ByteBuffer
 
 class Phase3HandshakeProtocolTestSuite {
 
@@ -38,14 +39,59 @@ class Phase3HandshakeProtocolTestSuite {
         bobIdentity = TestIdentitySimulator()
     }
 
+    private fun buildInitSignData(reqId: String, ik: ByteArray, ek: ByteArray, timestamp: Long): ByteArray {
+        val domain = "WASL1:INIT:v1:".toByteArray(Charsets.UTF_8)
+        val reqBytes = reqId.toByteArray(Charsets.UTF_8)
+        return ByteBuffer.allocate(domain.size + 2 + reqBytes.size + 32 + 32 + 8)
+            .put(domain)
+            .putShort(reqBytes.size.toShort())
+            .put(reqBytes)
+            .put(ik)
+            .put(ek)
+            .putLong(timestamp)
+            .array()
+    }
+
+    private fun buildRespSignData(
+        reqId: String,
+        respIk: ByteArray,
+        respEk: ByteArray,
+        initIk: ByteArray,
+        initEk: ByteArray
+    ): ByteArray {
+        val domain = "WASL1:RESP:v1:".toByteArray(Charsets.UTF_8)
+        val reqBytes = reqId.toByteArray(Charsets.UTF_8)
+        return ByteBuffer.allocate(domain.size + 2 + reqBytes.size + 32 + 32 + 32 + 32)
+            .put(domain)
+            .putShort(reqBytes.size.toShort())
+            .put(reqBytes)
+            .put(respIk)
+            .put(respEk)
+            .put(initIk)
+            .put(initEk)
+            .array()
+    }
+
+    private fun buildRejectSignData(reqId: String, rejectorIk: ByteArray, timestamp: Long): ByteArray {
+        val domain = "WASL1:REJ:v1:".toByteArray(Charsets.UTF_8)
+        val reqBytes = reqId.toByteArray(Charsets.UTF_8)
+        return ByteBuffer.allocate(domain.size + 2 + reqBytes.size + 32 + 8)
+            .put(domain)
+            .putShort(reqBytes.size.toShort())
+            .put(reqBytes)
+            .put(rejectorIk)
+            .putLong(timestamp)
+            .array()
+    }
+
     @Test
     fun test_1_Full_Handshake_Flow_End_To_End() {
-        // --- 1. Alice creates INIT ---
+        // --- 1. Alice creates INIT using canonical domain-separated format ---
         val aliceEphemeral = Curve25519Engine.generateX25519KeyPair()
         val reqId = "W100AF"
         val timestamp = System.currentTimeMillis()
 
-        val aliceSignData = (reqId + ":").toByteArray() + aliceEphemeral.publicKey + timestamp.toString().toByteArray()
+        val aliceSignData = buildInitSignData(reqId, aliceIdentity.getPublic(), aliceEphemeral.publicKey, timestamp)
         val aliceSig = aliceIdentity.sign(aliceSignData)
 
         val initPacket = HandshakePacket.Init(reqId, aliceIdentity.getPublic(), aliceEphemeral.publicKey, timestamp, aliceSig)
@@ -59,13 +105,24 @@ class Phase3HandshakeProtocolTestSuite {
         assertNotNull("Bob must successfully parse INIT packet", parsedInit)
         assertEquals(reqId, parsedInit!!.requestId)
 
-        // Bob verifies Alice's signature
-        val bobVerifyData = (parsedInit.requestId + ":").toByteArray() + parsedInit.ephemeralPublicKey + parsedInit.timestamp.toString().toByteArray()
+        // Bob verifies Alice's canonical signature
+        val bobVerifyData = buildInitSignData(
+            parsedInit.requestId,
+            parsedInit.identityPublicKey,
+            parsedInit.ephemeralPublicKey,
+            parsedInit.timestamp
+        )
         assertTrue("Bob must verify Alice's signature", bobIdentity.verify(parsedInit.identityPublicKey, bobVerifyData, parsedInit.signature))
 
-        // --- 3. Bob accepts and creates RESPONSE ---
+        // --- 3. Bob accepts and creates RESPONSE using canonical domain-separated format ---
         val bobEphemeral = Curve25519Engine.generateX25519KeyPair()
-        val bobSignData = (reqId + ":").toByteArray() + bobEphemeral.publicKey + parsedInit.ephemeralPublicKey
+        val bobSignData = buildRespSignData(
+            reqId,
+            bobIdentity.getPublic(),
+            bobEphemeral.publicKey,
+            parsedInit.identityPublicKey,
+            parsedInit.ephemeralPublicKey
+        )
         val bobSig = bobIdentity.sign(bobSignData)
 
         val respPacket = HandshakePacket.Response(reqId, bobIdentity.getPublic(), bobEphemeral.publicKey, bobSig)
@@ -81,8 +138,14 @@ class Phase3HandshakeProtocolTestSuite {
         val parsedResp = HandshakePacketCodec.decode(sms2) as? HandshakePacket.Response
         assertNotNull("Alice must successfully parse RESPONSE packet", parsedResp)
 
-        // Alice verifies Bob's signature
-        val aliceVerifyData = (reqId + ":").toByteArray() + parsedResp!!.ephemeralPublicKey + aliceEphemeral.publicKey
+        // Alice verifies Bob's canonical signature bound to both identity & ephemeral keys
+        val aliceVerifyData = buildRespSignData(
+            reqId,
+            parsedResp!!.identityPublicKey,
+            parsedResp.ephemeralPublicKey,
+            aliceIdentity.getPublic(),
+            aliceEphemeral.publicKey
+        )
         assertTrue("Alice must verify Bob's signature", aliceIdentity.verify(parsedResp.identityPublicKey, aliceVerifyData, parsedResp.signature))
 
         // Alice computes shared secret & derives initiator session keys
@@ -113,18 +176,31 @@ class Phase3HandshakeProtocolTestSuite {
     @Test
     fun test_2_Rejection_Flow_And_3_Minute_Cooldown() {
         val reqId = "W200REJ"
-        val rejectPacket = HandshakePacket.Reject(reqId)
+        val now = System.currentTimeMillis()
+        val rejSignData = buildRejectSignData(reqId, bobIdentity.getPublic(), now)
+        val rejSig = bobIdentity.sign(rejSignData)
+        val rejectPacket = HandshakePacket.Reject(
+            requestId = reqId,
+            timestamp = now,
+            identityPublicKey = bobIdentity.getPublic(),
+            signature = rejSig
+        )
         val smsReject = HandshakePacketCodec.encode(rejectPacket)
 
-        assertEquals("WASL1:REJ:W200REJ", smsReject)
+        assertTrue("Encoded REJECT must match WASL1:REJ:<reqId>:<timestamp>:<ik>:<sig>", smsReject.startsWith("WASL1:REJ:$reqId:$now:"))
 
-        // Recipient parses REJECT
+        // Recipient parses signed REJECT
         val parsed = HandshakePacketCodec.decode(smsReject) as? HandshakePacket.Reject
-        assertNotNull(parsed)
+        assertNotNull("Signed REJECT packet must decode cleanly", parsed)
         assertEquals(reqId, parsed!!.requestId)
+        assertEquals(now, parsed.timestamp)
+        assertArrayEquals(bobIdentity.getPublic(), parsed.identityPublicKey)
+        assertTrue(
+            "Signed REJECT signature must verify",
+            aliceIdentity.verify(bobIdentity.getPublic(), buildRejectSignData(parsed.requestId, bobIdentity.getPublic(), parsed.timestamp), parsed.signature)
+        )
 
         // Enforce 3-minute cooldown
-        val now = System.currentTimeMillis()
         val rejectedAt = now - (60 * 1000L) // 1 minute ago
 
         val remainingSeconds = HandshakeStateMachine.checkRejectionCooldown(rejectedAt, now)

@@ -19,10 +19,10 @@ class Phase4SmsEngineTestSuite {
 
     @Test
     fun test_1_ChatMessage_Packet_Codec_Roundtrip() {
-        val convId = "conv-100"
-        val msgId = "msg-999"
+        val convId = "0123456789abcdef"
+        val msgId = "fedcba9876543210"
         val seqNo = 42L
-        val nonce = ByteArray(12) { it.toByte() }
+        val nonce = MonotonicNonceManager().createNonceForCounter(seqNo)
         val ciphertext = "CIPHERTEXT_WITH_GCM_AUTH_TAG_16_BYTES".toByteArray(Charsets.UTF_8)
 
         val packet = ChatMessagePacket(
@@ -36,7 +36,7 @@ class Phase4SmsEngineTestSuite {
         )
 
         val smsText = ChatMessageCodec.encode(packet)
-        assertTrue("SMS text must start with WASL1:MSG:", smsText.startsWith("WASL1:MSG:conv-100:msg-999:42:1/1:"))
+        assertTrue("SMS text must start with WASL1:MSG:", smsText.startsWith("WASL1:MSG:$convId:$msgId:0001:1/1:"))
         assertTrue(ChatMessageCodec.isEncryptedChatMessage(smsText))
 
         val decoded = ChatMessageCodec.decode(smsText)
@@ -57,8 +57,8 @@ class Phase4SmsEngineTestSuite {
         val (nonce, _) = nonceManager.generateNextNonce()
 
         val originalText = "رسالة سرية وموثقة عبر WASL SMS"
-        val convId = "conv-alice-bob"
-        val msgId = "msg-001"
+        val convId = "0011223344556677"
+        val msgId = "8899aabbccddeeff"
         val seqNo = 1L
 
         val aad = "$convId:$msgId:$seqNo:1/1".toByteArray(Charsets.UTF_8)

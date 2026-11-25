@@ -52,11 +52,12 @@ fun ChatItemRow(
     val customColors = LocalWaslColors.current
 
     // Reactive Countdown Timer for the 3-minute post-rejection cooldown
-    var remainingCooldown by remember(conversation.rejectedAt) {
+    var remainingCooldown by remember(conversation.rejectedAt, conversation.handshakeStatus) {
         mutableStateOf(conversation.remainingCooldownSeconds())
     }
 
     LaunchedEffect(conversation.rejectedAt, conversation.handshakeStatus) {
+        remainingCooldown = conversation.remainingCooldownSeconds()
         if (conversation.handshakeStatus == HandshakeStatus.REJECTED) {
             while (remainingCooldown > 0) {
                 delay(1000L)
@@ -96,14 +97,20 @@ fun ChatItemRow(
             // Lock / Pending / Cooldown indicator badge
             val badgeColor = when (conversation.handshakeStatus) {
                 HandshakeStatus.READY -> WaslEmeraldActive
-                HandshakeStatus.WAITING, HandshakeStatus.NEW -> WaslAmberPending
-                HandshakeStatus.REJECTED -> WaslRoseReject
+                HandshakeStatus.WAITING,
+                HandshakeStatus.NEW,
+                HandshakeStatus.PENDING_CONFIRM_SEND -> WaslAmberPending
+                HandshakeStatus.REJECTED,
+                HandshakeStatus.KEY_CHANGED_ALERT -> WaslRoseReject
                 else -> Color.Gray
             }
             val badgeIcon = when (conversation.handshakeStatus) {
                 HandshakeStatus.READY -> "🔒"
-                HandshakeStatus.WAITING, HandshakeStatus.NEW -> "⏳"
+                HandshakeStatus.WAITING,
+                HandshakeStatus.NEW,
+                HandshakeStatus.PENDING_CONFIRM_SEND -> "⏳"
                 HandshakeStatus.REJECTED -> "✕"
+                HandshakeStatus.KEY_CHANGED_ALERT -> "!"
                 else -> "•"
             }
 
@@ -165,23 +172,38 @@ fun ChatItemRow(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                val snippetText = when (conversation.handshakeStatus) {
-                    HandshakeStatus.READY -> conversation.lastMessage ?: "محادثة مشفرة جديدة"
-                    HandshakeStatus.WAITING -> "طلب تأسيس محادثة مشفرة عبر SMS (بانتظار الرد)..."
-                    HandshakeStatus.REJECTED -> {
+                val isNewWithoutRequest =
+                    conversation.handshakeStatus == HandshakeStatus.NEW ||
+                    (conversation.handshakeStatus == HandshakeStatus.WAITING && conversation.currentRequestId == null)
+
+                val snippetText = when {
+                    conversation.handshakeStatus == HandshakeStatus.READY ->
+                        conversation.lastMessage ?: "محادثة مشفرة جديدة"
+                    isNewWithoutRequest ->
+                        conversation.lastMessage ?: "محادثة جديدة (اضغط لبدء التأسيس)"
+                    conversation.handshakeStatus == HandshakeStatus.WAITING ->
+                        conversation.lastMessage ?: "طلب تأسيس محادثة مشفرة عبر SMS (بانتظار الرد)..."
+                    conversation.handshakeStatus == HandshakeStatus.PENDING_CONFIRM_SEND ->
+                        conversation.lastMessage ?: "⏳ جاري إرسال تأكيد المصافحة..."
+                    conversation.handshakeStatus == HandshakeStatus.KEY_CHANGED_ALERT ->
+                        conversation.lastMessage ?: "⚠️ تحذير أمني: تغيرت الهوية الرقمية للطرف الآخر!"
+                    conversation.handshakeStatus == HandshakeStatus.REJECTED -> {
                         if (remainingCooldown > 0) "تم رفض الطلب. انتظر انقضاء المهلة لإعادة الإرسال"
                         else "تم رفض الطلب. يمكنك الآن إرسال طلب جديد"
                     }
-                    HandshakeStatus.EXPIRED -> "انتهت مهلة الطلب (24 ساعة). اضغط لإعادة الإرسال"
-                    else -> "محادثة مشفرة"
+                    conversation.handshakeStatus == HandshakeStatus.EXPIRED -> "انتهت مهلة الطلب. اضغط لإعادة الإرسال"
+                    else -> conversation.lastMessage ?: "محادثة مشفرة"
                 }
 
                 Text(
                     text = snippetText,
                     style = MaterialTheme.typography.bodySmall,
-                    color = when (conversation.handshakeStatus) {
-                        HandshakeStatus.WAITING -> WaslAmberPending
-                        HandshakeStatus.REJECTED -> WaslRoseReject.copy(alpha = 0.8f)
+                    color = when {
+                        isNewWithoutRequest -> customColors.textSecondary
+                        conversation.handshakeStatus == HandshakeStatus.WAITING ||
+                        conversation.handshakeStatus == HandshakeStatus.PENDING_CONFIRM_SEND -> WaslAmberPending
+                        conversation.handshakeStatus == HandshakeStatus.REJECTED ||
+                        conversation.handshakeStatus == HandshakeStatus.KEY_CHANGED_ALERT -> WaslRoseReject
                         else -> customColors.textSecondary
                     },
                     maxLines = 1,
@@ -189,7 +211,23 @@ fun ChatItemRow(
                     modifier = Modifier.weight(1f)
                 )
 
-                if (conversation.handshakeStatus == HandshakeStatus.READY) {
+                if (conversation.unreadCount > 0) {
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Box(
+                        modifier = Modifier
+                            .clip(CircleShape)
+                            .background(WaslEmeraldActive)
+                            .padding(horizontal = 7.dp, vertical = 2.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            text = if (conversation.unreadCount > 99) "+99" else conversation.unreadCount.toString(),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = Color.White,
+                            fontSize = 11.sp
+                        )
+                    }
+                } else if (conversation.handshakeStatus == HandshakeStatus.READY) {
                     Text(
                         text = "✓✓",
                         style = MaterialTheme.typography.labelSmall,

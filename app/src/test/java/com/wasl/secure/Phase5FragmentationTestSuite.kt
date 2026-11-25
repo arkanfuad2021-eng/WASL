@@ -4,6 +4,7 @@ import com.wasl.secure.core.crypto.AesGcmCipher
 import com.wasl.secure.core.crypto.MonotonicNonceManager
 import com.wasl.secure.core.protocol.ChatMessagePacket
 import com.wasl.secure.data.local.dao.MessageChunkDao
+import com.wasl.secure.data.local.dao.ProcessChunkResult
 import com.wasl.secure.data.local.entity.MessageChunkEntity
 import com.wasl.secure.telephony.MessageChunkManager
 import kotlinx.coroutines.runBlocking
@@ -25,28 +26,98 @@ class Phase5FragmentationTestSuite {
         private val buffer = mutableMapOf<String, MessageChunkEntity>()
 
         override suspend fun insertChunk(chunk: MessageChunkEntity): Long {
-            // Ignore duplicates
-            if (buffer.containsKey(chunk.id)) return -1L
-            buffer[chunk.id] = chunk
+            val key = "${chunk.conversationId}_${chunk.messageId}_${chunk.attemptId}_${chunk.chunkIndex}"
+            if (buffer.containsKey(key)) return -1L
+            buffer[key] = chunk
             return 1L
         }
 
-        override suspend fun getChunksForMessage(messageId: String): List<MessageChunkEntity> {
+        override suspend fun getChunksForAttempt(
+            conversationId: String,
+            messageId: String,
+            attemptId: String
+        ): List<MessageChunkEntity> {
             return buffer.values
-                .filter { it.messageId == messageId }
+                .filter { it.conversationId == conversationId && it.messageId == messageId && it.attemptId == attemptId }
                 .sortedBy { it.chunkIndex }
         }
 
-        override suspend fun getChunkCountForMessage(messageId: String): Int {
-            return buffer.values.count { it.messageId == messageId }
+        override suspend fun getChunkCountForAttempt(
+            conversationId: String,
+            messageId: String,
+            attemptId: String
+        ): Int {
+            return buffer.values.count { it.conversationId == conversationId && it.messageId == messageId && it.attemptId == attemptId }
+        }
+
+        override suspend fun deleteChunksForAttempt(
+            conversationId: String,
+            messageId: String,
+            attemptId: String
+        ) {
+            buffer.entries.removeIf {
+                it.value.conversationId == conversationId && it.value.messageId == messageId && it.value.attemptId == attemptId
+            }
+        }
+
+        override suspend fun deleteChunksForMessage(conversationId: String, messageId: String) {
+            buffer.entries.removeIf { it.value.conversationId == conversationId && it.value.messageId == messageId }
         }
 
         override suspend fun deleteChunksForMessage(messageId: String) {
             buffer.entries.removeIf { it.value.messageId == messageId }
         }
 
+        override suspend fun deleteChunksForConversation(
+            conversationId: String,
+            packetConversationId: String
+        ) {
+            buffer.entries.removeIf {
+                it.value.conversationId == conversationId || it.value.conversationId == packetConversationId
+            }
+        }
+
         override suspend fun deleteExpiredChunks(expiryTimestamp: Long) {
             buffer.entries.removeIf { it.value.receivedAt < expiryTimestamp }
+        }
+
+        override suspend fun processAndCheckChunkAtomic(chunk: MessageChunkEntity): ProcessChunkResult {
+            if (chunk.chunkIndex < 1 || chunk.totalChunks < 1 || chunk.chunkIndex > chunk.totalChunks) {
+                return ProcessChunkResult.Conflicted
+            }
+            val existing = getChunksForAttempt(chunk.conversationId, chunk.messageId, chunk.attemptId)
+            if (existing.any { it.chunkIndex == 0 || it.chunkPayloadBase64 == "CONFLICT" }) {
+                return ProcessChunkResult.Conflicted
+            }
+            val validExisting = existing.filter { it.chunkIndex > 0 }
+            if (validExisting.isNotEmpty()) {
+                val first = validExisting.first()
+                val sameIndex = validExisting.find { it.chunkIndex == chunk.chunkIndex }
+                val hasPayloadConflict = sameIndex != null && sameIndex.chunkPayloadBase64 != chunk.chunkPayloadBase64
+                if (chunk.totalChunks != first.totalChunks ||
+                    chunk.nonceBase64 != first.nonceBase64 ||
+                    chunk.sequenceNumber != first.sequenceNumber ||
+                    hasPayloadConflict
+                ) {
+                    insertChunk(chunk.copy(chunkIndex = 0, chunkPayloadBase64 = "CONFLICT"))
+                    return ProcessChunkResult.Conflicted
+                }
+            }
+            insertChunk(chunk)
+            val updated = getChunksForAttempt(chunk.conversationId, chunk.messageId, chunk.attemptId)
+            val valid = updated.filter { it.chunkIndex > 0 }
+            if (valid.size == chunk.totalChunks) {
+                val sorted = valid.sortedBy { it.chunkIndex }
+                val isContiguous = sorted.mapIndexed { idx, entity -> entity.chunkIndex == idx + 1 }.all { it }
+                if (isContiguous) {
+                    return ProcessChunkResult.Complete(sorted)
+                }
+            }
+            return ProcessChunkResult.Incomplete
+        }
+
+        fun getChunkCountForMessage(messageId: String): Int {
+            return buffer.values.count { it.messageId == messageId }
         }
     }
 
@@ -64,8 +135,8 @@ class Phase5FragmentationTestSuite {
         val nonceManager = MonotonicNonceManager(100L)
         val (nonce, _) = nonceManager.generateNextNonce()
 
-        val convId = "conv-frag-1"
-        val msgId = "msg-frag-1"
+        val convId = "0123456789abcdef"
+        val msgId = "fedcba9876543210"
         val seqNo = 100L
 
         // Encrypt with dummy AAD
@@ -101,15 +172,20 @@ class Phase5FragmentationTestSuite {
         val originalText = "رسالة تجزئة اختبارية: وصول مبعثر للأجزاء وإعادة تجميع دقيقة"
         val key = ByteArray(32) { 0x55.toByte() }
         val (nonce, _) = MonotonicNonceManager(1L).generateNextNonce()
-        val convId = "conv-scramble"
-        val msgId = "msg-scramble"
+        val convId = "1122334455667788"
+        val msgId = "99aabbccddeeff00"
         val seqNo = 5L
 
         val aad = "$convId:$msgId:$seqNo:1/3".toByteArray(Charsets.UTF_8)
         val encrypted = AesGcmCipher.encrypt(key, nonce, originalText.toByteArray(Charsets.UTF_8), aad)
 
         val packets = MessageChunkManager.fragmentCiphertext(
-            convId, msgId, seqNo, nonce, encrypted.ciphertextWithTag
+            conversationId = convId,
+            messageId = msgId,
+            attemptId = "0001",
+            sequenceNumber = seqNo,
+            nonce = nonce,
+            ciphertextWithTag = encrypted.ciphertextWithTag
         )
         // Assume 3 parts for this test
         val chunk1 = packets.getOrNull(0) ?: packets[0]
@@ -132,15 +208,17 @@ class Phase5FragmentationTestSuite {
         assertEquals(3, res2.totalChunks)
         assertArrayEquals(nonce, res2.nonce)
 
-        // Verify buffer cleanup
-        assertEquals("Buffer table must be cleaned up after successful reassembly", 0, chunkDao.getChunkCountForMessage(msgId))
+        // Verify chunks are preserved until verified decryption, then cleaned up
+        assertEquals("Chunks must be retained until verified decryption", 3, chunkDao.getChunkCountForMessage(msgId))
+        chunkDao.deleteChunksForMessage(msgId)
+        assertEquals("Buffer table is cleaned up after successful decryption", 0, chunkDao.getChunkCountForMessage(msgId))
     }
 
     @Test
     fun test_3_Duplicate_Chunk_Delivery_Ignored() = runBlocking {
         val packet = ChatMessagePacket(
-            conversationId = "conv-dup",
-            messageId = "msg-dup",
+            conversationId = "2233445566778899",
+            messageId = "aabbccddeeff0011",
             sequenceNumber = 1L,
             chunkIndex = 1,
             totalChunks = 2,
@@ -150,11 +228,11 @@ class Phase5FragmentationTestSuite {
 
         // Deliver chunk 1
         MessageChunkManager.processIncomingChunk(packet, chunkDao)
-        assertEquals(1, chunkDao.getChunkCountForMessage("msg-dup"))
+        assertEquals(1, chunkDao.getChunkCountForMessage("aabbccddeeff0011"))
 
         // Duplicate delivery of chunk 1
         MessageChunkManager.processIncomingChunk(packet, chunkDao)
-        assertEquals("Duplicate chunk must be ignored without increasing count", 1, chunkDao.getChunkCountForMessage("msg-dup"))
+        assertEquals("Duplicate chunk must be ignored without increasing count", 1, chunkDao.getChunkCountForMessage("aabbccddeeff0011"))
     }
 
     @Test
@@ -162,14 +240,21 @@ class Phase5FragmentationTestSuite {
         val originalText = "نص اختبار التحقق من التلاعب في الأجزاء المجزأة"
         val key = ByteArray(32) { 0x77.toByte() }
         val (nonce, _) = MonotonicNonceManager(10L).generateNextNonce()
-        val convId = "conv-tamp"
-        val msgId = "msg-tamp"
+        val convId = "33445566778899aa"
+        val msgId = "bbccddeeff001122"
         val seqNo = 12L
 
         val aad = "$convId:$msgId:$seqNo:1/2".toByteArray(Charsets.UTF_8)
         val encrypted = AesGcmCipher.encrypt(key, nonce, originalText.toByteArray(Charsets.UTF_8), aad)
 
-        val packets = MessageChunkManager.fragmentCiphertext(convId, msgId, seqNo, nonce, encrypted.ciphertextWithTag)
+        val packets = MessageChunkManager.fragmentCiphertext(
+            conversationId = convId,
+            messageId = msgId,
+            attemptId = "0001",
+            sequenceNumber = seqNo,
+            nonce = nonce,
+            ciphertextWithTag = encrypted.ciphertextWithTag
+        )
         val p1 = packets[0]
         val p2 = if (packets.size > 1) packets[1] else packets[0].copy(chunkIndex = 2, totalChunks = 2)
 

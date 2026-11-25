@@ -50,7 +50,9 @@ object HandshakePacketCodec {
                 "$MAGIC_PREFIX:$TYPE_CONF:${packet.requestId}:$macB64"
             }
             is HandshakePacket.Reject -> {
-                "$MAGIC_PREFIX:$TYPE_REJ:${packet.requestId}"
+                val ikB64 = b64Encoder.encodeToString(packet.identityPublicKey)
+                val sigB64 = b64Encoder.encodeToString(packet.signature)
+                "$MAGIC_PREFIX:$TYPE_REJ:${packet.requestId}:${packet.timestamp}:$ikB64:$sigB64"
             }
         }
     }
@@ -89,8 +91,18 @@ object HandshakePacketCodec {
                     HandshakePacket.Confirm(requestId, mac)
                 }
                 TYPE_REJ -> {
-                    if (parts.size != 3) return null
-                    HandshakePacket.Reject(requestId)
+                    if (parts.size == 6) {
+                        val timestamp = parts[3].toLong()
+                        val identityKey = b64Decoder.decode(parts[4])
+                        val signature = b64Decoder.decode(parts[5])
+                        HandshakePacket.Reject(requestId, timestamp, identityKey, signature)
+                    } else if (parts.size == 5) {
+                        val timestamp = parts[3].toLong()
+                        val signature = b64Decoder.decode(parts[4])
+                        HandshakePacket.Reject(requestId, timestamp, ByteArray(0), signature)
+                    } else {
+                        null
+                    }
                 }
                 else -> null
             }

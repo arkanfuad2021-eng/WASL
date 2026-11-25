@@ -2,6 +2,7 @@ package com.wasl.secure.telephony
 
 import com.wasl.secure.core.protocol.ChatMessagePacket
 import com.wasl.secure.data.local.dao.MessageChunkDao
+import com.wasl.secure.data.local.dao.ProcessChunkResult
 import com.wasl.secure.data.local.entity.MessageChunkEntity
 import java.io.ByteArrayOutputStream
 import java.util.Base64
@@ -9,19 +10,34 @@ import kotlin.math.ceil
 
 /**
  * Manages the splitting of long encrypted messages into SMS-sized chunks,
- * and the out-of-order reassembly upon receipt.
+ * and the atomic out-of-order reassembly upon receipt, strictly isolated by (conversationId, messageId, attemptId).
  * Conforms to Section 7 of the Master Specification.
  */
 object MessageChunkManager {
 
-    // Maximum raw ciphertext bytes per SMS segment (leaving room for headers and Base64 expansion)
-    const val MAX_CHUNK_PAYLOAD_BYTES = 95
+    // Maximum raw ciphertext bytes per SMS segment (leaving room for 72-char headers in 160-char SMS)
+    // 63 raw bytes * (4/3) = 84 Base64url characters. 72 + 84 = 156 characters <= 160 characters.
+    const val MAX_CHUNK_PAYLOAD_BYTES = 63
+    const val CHUNK_EXPIRY_MS = 24L * 60L * 60L * 1000L // 24 hours
+    private const val GCM_TAG_LENGTH_BYTES = 16
     private val b64Encoder = Base64.getUrlEncoder().withoutPadding()
     private val b64Decoder = Base64.getUrlDecoder()
+
+    /**
+     * Calculates the exact number of single-segment SMS chunks required for plaintext
+     * after AES-256-GCM encryption (UTF-8 payload + 16-byte tag) at 63 raw bytes per chunk.
+     */
+    fun estimateEncryptedSmsParts(plainText: String): Int {
+        if (plainText.isEmpty()) return 1
+        val totalCipherBytes = plainText.toByteArray(Charsets.UTF_8).size + GCM_TAG_LENGTH_BYTES
+        val parts = ceil(totalCipherBytes.toDouble() / MAX_CHUNK_PAYLOAD_BYTES).toInt()
+        return parts.coerceAtLeast(1)
+    }
 
     data class ReassembledMessage(
         val conversationId: String,
         val messageId: String,
+        val attemptId: String,
         val sequenceNumber: Long,
         val totalChunks: Int,
         val nonce: ByteArray,
@@ -33,6 +49,7 @@ object MessageChunkManager {
             other as ReassembledMessage
             if (conversationId != other.conversationId) return false
             if (messageId != other.messageId) return false
+            if (attemptId != other.attemptId) return false
             if (sequenceNumber != other.sequenceNumber) return false
             if (totalChunks != other.totalChunks) return false
             if (!nonce.contentEquals(other.nonce)) return false
@@ -43,6 +60,7 @@ object MessageChunkManager {
         override fun hashCode(): Int {
             var result = conversationId.hashCode()
             result = 31 * result + messageId.hashCode()
+            result = 31 * result + attemptId.hashCode()
             result = 31 * result + sequenceNumber.hashCode()
             result = 31 * result + totalChunks
             result = 31 * result + nonce.contentHashCode()
@@ -64,6 +82,7 @@ object MessageChunkManager {
     fun fragmentCiphertext(
         conversationId: String,
         messageId: String,
+        attemptId: String = "0001",
         sequenceNumber: Long,
         nonce: ByteArray,
         ciphertextWithTag: ByteArray
@@ -75,6 +94,7 @@ object MessageChunkManager {
                 ChatMessagePacket(
                     conversationId = conversationId,
                     messageId = messageId,
+                    attemptId = attemptId,
                     sequenceNumber = sequenceNumber,
                     chunkIndex = 1,
                     totalChunks = 1,
@@ -98,6 +118,7 @@ object MessageChunkManager {
                 ChatMessagePacket(
                     conversationId = conversationId,
                     messageId = messageId,
+                    attemptId = attemptId,
                     sequenceNumber = sequenceNumber,
                     chunkIndex = i,
                     totalChunks = totalChunks,
@@ -111,69 +132,49 @@ object MessageChunkManager {
     }
 
     /**
-     * Processes an incoming chunk. If all chunks for this message have arrived,
-     * reassembles the full ciphertext and returns it. Otherwise returns null.
+     * Processes an incoming chunk atomically. Validates metadata consistency, detects conflicts,
+     * buffers the chunk, and if complete, reassembles the full ciphertext and returns it.
+     * Note: Chunks are NOT deleted here; they are preserved until AES-GCM decryption succeeds in Receiver.
      */
     suspend fun processIncomingChunk(
         packet: ChatMessagePacket,
         chunkDao: MessageChunkDao
     ): ReassembledMessage? {
-        // Fast path for single-chunk messages
-        if (packet.totalChunks == 1) {
-            return ReassembledMessage(
-                conversationId = packet.conversationId,
-                messageId = packet.messageId,
-                sequenceNumber = packet.sequenceNumber,
-                totalChunks = 1,
-                nonce = packet.nonce,
-                fullCiphertextWithTag = packet.ciphertextWithTag
-            )
-        }
-
-        // 1. Buffer the chunk in persistent database (Ignore duplicates)
         val chunkEntity = MessageChunkEntity(
-            id = "${packet.messageId}_${packet.chunkIndex}",
-            messageId = packet.messageId,
             conversationId = packet.conversationId,
+            messageId = packet.messageId,
+            attemptId = packet.attemptId,
             chunkIndex = packet.chunkIndex,
             totalChunks = packet.totalChunks,
             chunkPayloadBase64 = b64Encoder.encodeToString(packet.ciphertextWithTag),
             nonceBase64 = b64Encoder.encodeToString(packet.nonce),
             sequenceNumber = packet.sequenceNumber
         )
-        chunkDao.insertChunk(chunkEntity)
 
-        // 2. Check if all required chunks have arrived
-        val arrivedCount = chunkDao.getChunkCountForMessage(packet.messageId)
-        if (arrivedCount < packet.totalChunks) {
-            // Still waiting for remaining parts
-            return null
+        val result = chunkDao.processAndCheckChunkAtomic(chunkEntity)
+
+        return when (result) {
+            is ProcessChunkResult.Complete -> {
+                // Assemble full ciphertext in exact numerical order (1..N)
+                val outputStream = ByteArrayOutputStream()
+                for (chunk in result.sortedChunks) {
+                    val sliceBytes = b64Decoder.decode(chunk.chunkPayloadBase64)
+                    outputStream.write(sliceBytes)
+                }
+                val fullCiphertext = outputStream.toByteArray()
+
+                ReassembledMessage(
+                    conversationId = packet.conversationId,
+                    messageId = packet.messageId,
+                    attemptId = packet.attemptId,
+                    sequenceNumber = packet.sequenceNumber,
+                    totalChunks = packet.totalChunks,
+                    nonce = packet.nonce,
+                    fullCiphertextWithTag = fullCiphertext
+                )
+            }
+            is ProcessChunkResult.Conflicted -> null
+            is ProcessChunkResult.Incomplete -> null
         }
-
-        // 3. All chunks are present! Reassemble in exact numerical order (1..N)
-        val allChunks = chunkDao.getChunksForMessage(packet.messageId)
-        if (allChunks.size != packet.totalChunks) {
-            return null
-        }
-
-        val outputStream = ByteArrayOutputStream()
-        for (chunk in allChunks) {
-            val sliceBytes = b64Decoder.decode(chunk.chunkPayloadBase64)
-            outputStream.write(sliceBytes)
-        }
-
-        val fullCiphertext = outputStream.toByteArray()
-
-        // 4. Clean up temporary buffer table
-        chunkDao.deleteChunksForMessage(packet.messageId)
-
-        return ReassembledMessage(
-            conversationId = packet.conversationId,
-            messageId = packet.messageId,
-            sequenceNumber = packet.sequenceNumber,
-            totalChunks = packet.totalChunks,
-            nonce = packet.nonce,
-            fullCiphertextWithTag = fullCiphertext
-        )
     }
 }

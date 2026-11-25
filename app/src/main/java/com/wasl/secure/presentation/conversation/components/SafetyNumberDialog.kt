@@ -64,7 +64,7 @@ fun SafetyNumberDialog(
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 Text(
-                    text = "قارن هذا الرقم المكون من 60 رقماً مع الرقم الظاهر على هاتف ($contactName). إذا تطابقت الأرقام، فهذا يثبت 100% أن المحادثة مشفرة ولا يمكن لأي شبكة اعتراضها (Zero-MITM):",
+                    text = "قارن هذا الرقم المكون من 12 رقماً مع الرقم الظاهر على هاتف ($contactName). إذا تطابقت الأرقام، فهذا يثبت 100% أن المحادثة مشفرة ولا يمكن لأي شبكة اعتراضها (Zero-MITM):",
                     style = MaterialTheme.typography.bodySmall,
                     color = customColors.textSecondary,
                     textAlign = TextAlign.Center

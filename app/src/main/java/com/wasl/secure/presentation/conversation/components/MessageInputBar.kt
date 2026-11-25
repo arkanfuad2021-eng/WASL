@@ -33,6 +33,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.wasl.secure.R
 import com.wasl.secure.core.theme.LocalWaslColors
+import com.wasl.secure.telephony.MessageChunkManager
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
@@ -46,9 +47,9 @@ fun MessageInputBar(
 ) {
     val customColors = LocalWaslColors.current
 
-    // Real-time calculation of estimated SMS segments after encryption & Base64 overhead
+    // Real-time calculation of estimated SMS segments matching MessageChunkManager (63 bytes/part)
     val estimatedSmsParts = remember(text) {
-        calculatePostEncryptionSmsParts(text)
+        MessageChunkManager.estimateEncryptedSmsParts(text)
     }
 
     Column(
@@ -148,17 +149,4 @@ fun MessageInputBar(
             }
         }
     }
-}
-
-/**
- * Accurately estimates cellular SMS parts after AES-256-GCM encryption,
- * header protocol metadata, and Base64 expansion.
- */
-private fun calculatePostEncryptionSmsParts(plainText: String): Int {
-    if (plainText.isEmpty()) return 1
-    val plainBytes = plainText.toByteArray(Charsets.UTF_8).size
-    val totalCipherBytes = plainBytes + 16 + 12 + 26
-    val base64Length = ((totalCipherBytes + 2) / 3) * 4
-    val parts = (base64Length + 129) / 130
-    return if (parts < 1) 1 else parts
 }

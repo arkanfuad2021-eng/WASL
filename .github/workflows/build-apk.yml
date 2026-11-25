@@ -2,15 +2,15 @@ name: Build WASL APK
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [ main, master, ci/release-verify ]
   workflow_dispatch:
 
 jobs:
   build:
-    name: Build Android Debug APK
+    name: Build Release APK & Run Unit Tests
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
 
     steps:
       - name: Checkout Repository
@@ -23,33 +23,88 @@ jobs:
           distribution: 'temurin'
           cache: gradle
 
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK Platform 34 & Build Tools 34.0.0
+        run: |
+          set -euo pipefail
+          (set +o pipefail; yes | sdkmanager --licenses >/dev/null)
+          sdkmanager --install "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+
       - name: Make Gradle Wrapper Executable
         run: chmod +x gradlew
 
-      - name: Build Debug APK
-        run: ./gradlew assembleDebug --no-daemon --stacktrace
+      - name: Build Release APK (R8 & ProGuard)
+        run: ./gradlew assembleRelease --no-daemon --stacktrace
 
-      - name: Upload APK Artifact
+      - name: Align, Sign with Fixed Keystore & Verify Release APK
+        env:
+          TEST_KEYSTORE_BASE64: ${{ secrets.TEST_KEYSTORE_BASE64 }}
+          TEST_KEYSTORE_PASSWORD: ${{ secrets.TEST_KEYSTORE_PASSWORD }}
+          TEST_KEY_ALIAS: ${{ secrets.TEST_KEY_ALIAS }}
+          TEST_KEY_PASSWORD: ${{ secrets.TEST_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$TEST_KEYSTORE_BASE64"
+          test -n "$TEST_KEYSTORE_PASSWORD"
+          test -n "$TEST_KEY_ALIAS"
+          test -n "$TEST_KEY_PASSWORD"
+
+          UNSIGNED_APK="app/build/outputs/apk/release/app-release-unsigned.apk"
+          test -f "$UNSIGNED_APK"
+
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          test -n "$SDK_ROOT"
+          BUILD_TOOLS_DIR="$SDK_ROOT/build-tools/34.0.0"
+          test -x "$BUILD_TOOLS_DIR/zipalign"
+          test -x "$BUILD_TOOLS_DIR/apksigner"
+
+          TEST_KEYSTORE="$RUNNER_TEMP/wasl-signing.p12"
+          ALIGNED_APK="$RUNNER_TEMP/app-release-aligned.apk"
+          SIGNED_APK="$RUNNER_TEMP/WASL-v1.0.0-release-signed.apk"
+
+          cleanup() {
+            rm -f "$TEST_KEYSTORE" "$ALIGNED_APK"
+          }
+          trap cleanup EXIT
+
+          printf '%s' "$TEST_KEYSTORE_BASE64" | base64 -d > "$TEST_KEYSTORE"
+          chmod 600 "$TEST_KEYSTORE"
+
+          "$BUILD_TOOLS_DIR/zipalign" -p -f 4 "$UNSIGNED_APK" "$ALIGNED_APK"
+          "$BUILD_TOOLS_DIR/apksigner" sign \
+            --ks "$TEST_KEYSTORE" \
+            --ks-type PKCS12 \
+            --ks-key-alias "$TEST_KEY_ALIAS" \
+            --ks-pass env:TEST_KEYSTORE_PASSWORD \
+            --key-pass env:TEST_KEY_PASSWORD \
+            --out "$SIGNED_APK" \
+            "$ALIGNED_APK"
+
+          "$BUILD_TOOLS_DIR/apksigner" verify --verbose --print-certs "$SIGNED_APK"
+
+      - name: Upload Release Signed APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: WASL-Debug-APK
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: WASL-Release-Signed-APK
+          path: ${{ runner.temp }}/WASL-v1.0.0-release-signed.apk
           if-no-files-found: error
 
-      - name: Create GitHub Release with APK
-        uses: softprops/action-gh-release@v2
-        continue-on-error: true
-        if: startsWith(github.ref, 'refs/heads/main') || startsWith(github.ref, 'refs/heads/master')
+      - name: Upload R8 Mapping Artifact
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: v1.0.0-debug
-          name: WASL v1.0.0 Debug APK
-          body: |
-            ## WASL (وَصْل) – Secure SMS Messaging Application
-            النسخة التجريبية الأولى لتطبيق WASL للمراسلة المشفرة عبر SMS بدون إنترنت.
-            - تشفير كامل طرفاً لطرف (X25519, Ed25519, AES-256-GCM).
-            - دعم تعدد شرائح SIM وتجزئة الرسائل الطويلة.
-            - مخصص لشبكات الاتصال في اليمن (+967).
-            - بدون إنترنت نهائياً (Air-gapped).
-          files: app/build/outputs/apk/debug/app-debug.apk
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: WASL-R8-Mapping
+          path: app/build/outputs/mapping/release/
+          if-no-files-found: warn
+
+      - name: Run Unit Tests
+        run: ./gradlew testDebugUnitTest --no-daemon --stacktrace
+
+      - name: Upload Unit Test Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: WASL-Unit-Test-Reports
+          path: app/build/reports/tests/testDebugUnitTest/
+          if-no-files-found: warn

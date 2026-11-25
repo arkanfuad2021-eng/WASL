@@ -14,8 +14,17 @@ interface HandshakeDao {
     @Query("SELECT * FROM handshake_requests WHERE requestId = :requestId LIMIT 1")
     suspend fun getByRequestId(requestId: String): HandshakeEntity?
 
+    @Query("SELECT * FROM handshake_requests WHERE requestId = :requestId LIMIT 1")
+    fun observeByRequestId(requestId: String): Flow<HandshakeEntity?>
+
     @Query("SELECT * FROM handshake_requests WHERE phoneNumber = :phone AND status = 'WAITING' ORDER BY createdAt DESC LIMIT 1")
     suspend fun getActiveWaitingRequest(phone: String): HandshakeEntity?
+
+    @Query("SELECT * FROM handshake_requests WHERE conversationId = :conversationId AND isIncoming = 0 AND status = 'WAITING' ORDER BY createdAt DESC LIMIT 1")
+    suspend fun getActiveOutgoingWaitingRequest(conversationId: String): HandshakeEntity?
+
+    @Query("SELECT * FROM handshake_requests WHERE conversationId = :conversationId AND isIncoming = 1 AND status = 'WAITING' ORDER BY createdAt DESC LIMIT 1")
+    suspend fun getActiveIncomingWaitingRequest(conversationId: String): HandshakeEntity?
 
     @Query("SELECT * FROM handshake_requests WHERE isIncoming = 1 AND status = 'WAITING' ORDER BY createdAt DESC")
     fun getPendingIncomingRequests(): Flow<List<HandshakeEntity>>
@@ -29,6 +38,12 @@ interface HandshakeDao {
     @Query("UPDATE handshake_requests SET status = :status WHERE requestId = :requestId")
     suspend fun updateStatus(requestId: String, status: String)
 
+    @Query("UPDATE handshake_requests SET status = :status, rejectedAt = :rejectedAt WHERE requestId = :requestId")
+    suspend fun updateStatusAndRejectedAt(requestId: String, status: String, rejectedAt: Long?)
+
     @Query("DELETE FROM handshake_requests WHERE requestId = :requestId")
     suspend fun delete(requestId: String)
+
+    @Query("DELETE FROM handshake_requests WHERE conversationId = :conversationId")
+    suspend fun deleteForConversation(conversationId: String)
 }

@@ -5,8 +5,10 @@ enum class HandshakeStatus {
     WAITING,            // Sent INIT, waiting for recipient's response
     RESPONSE_RECEIVED,  // Recipient approved, processing response
     ESTABLISHING,       // Deriving keys & sending confirmation
+    PENDING_CONFIRM_SEND, // Initiator derived keys, waiting for confirmation SMS parts to be sent
     READY,              // Handshake complete, fully encrypted session
     REJECTED,           // Recipient rejected request (3-min cooldown)
+    KEY_CHANGED_ALERT,  // Security alert: identity key changed!
     EXPIRED,            // 24-hr timeout elapsed
     FAILED              // Network/telephony failure
 }

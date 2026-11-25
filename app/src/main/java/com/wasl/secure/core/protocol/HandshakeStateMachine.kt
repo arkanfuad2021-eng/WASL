@@ -10,7 +10,6 @@ import java.util.UUID
 object HandshakeStateMachine {
 
     const val REJECTION_COOLDOWN_MS = 3 * 60 * 1000L      // Exactly 3 minutes
-    const val PENDING_REQUEST_TIMEOUT_MS = 24 * 60 * 60 * 1000L // 24 hours
 
     /**
      * Generates a unique, non-guessable request ID (e.g. "W9F4A2").
@@ -31,38 +30,59 @@ object HandshakeStateMachine {
     }
 
     /**
-     * Checks if a pending request has exceeded the 24-hour validity period.
-     */
-    fun isRequestExpired(createdAt: Long, currentTime: Long = System.currentTimeMillis()): Boolean {
-        return (currentTime - createdAt) > PENDING_REQUEST_TIMEOUT_MS
-    }
-
-    /**
      * Validates whether a state transition is permitted by the protocol.
      */
     fun canTransition(from: HandshakeStatus, to: HandshakeStatus): Boolean {
         return when (from) {
-            HandshakeStatus.NEW -> to in listOf(HandshakeStatus.WAITING, HandshakeStatus.FAILED)
+            HandshakeStatus.NEW -> to in listOf(
+                HandshakeStatus.WAITING,
+                HandshakeStatus.FAILED,
+                HandshakeStatus.KEY_CHANGED_ALERT
+            )
             HandshakeStatus.WAITING -> to in listOf(
                 HandshakeStatus.RESPONSE_RECEIVED,
+                HandshakeStatus.ESTABLISHING,
+                HandshakeStatus.PENDING_CONFIRM_SEND,
                 HandshakeStatus.READY,
                 HandshakeStatus.REJECTED,
-                HandshakeStatus.EXPIRED,
+                HandshakeStatus.KEY_CHANGED_ALERT,
                 HandshakeStatus.FAILED
             )
             HandshakeStatus.RESPONSE_RECEIVED -> to in listOf(
                 HandshakeStatus.ESTABLISHING,
+                HandshakeStatus.PENDING_CONFIRM_SEND,
                 HandshakeStatus.READY,
+                HandshakeStatus.KEY_CHANGED_ALERT,
                 HandshakeStatus.FAILED
             )
             HandshakeStatus.ESTABLISHING -> to in listOf(
+                HandshakeStatus.PENDING_CONFIRM_SEND,
                 HandshakeStatus.READY,
+                HandshakeStatus.KEY_CHANGED_ALERT,
                 HandshakeStatus.FAILED
             )
-            HandshakeStatus.REJECTED -> to in listOf(HandshakeStatus.NEW, HandshakeStatus.WAITING)
-            HandshakeStatus.EXPIRED -> to in listOf(HandshakeStatus.NEW, HandshakeStatus.WAITING)
-            HandshakeStatus.READY -> false // Ready conversations cannot revert
-            HandshakeStatus.FAILED -> to in listOf(HandshakeStatus.WAITING, HandshakeStatus.NEW)
+            HandshakeStatus.PENDING_CONFIRM_SEND -> to in listOf(
+                HandshakeStatus.READY,
+                HandshakeStatus.KEY_CHANGED_ALERT,
+                HandshakeStatus.FAILED
+            )
+            HandshakeStatus.REJECTED -> to in listOf(
+                HandshakeStatus.NEW,
+                HandshakeStatus.WAITING,
+                HandshakeStatus.KEY_CHANGED_ALERT
+            )
+            HandshakeStatus.EXPIRED -> to in listOf(
+                HandshakeStatus.NEW,
+                HandshakeStatus.WAITING,
+                HandshakeStatus.KEY_CHANGED_ALERT
+            )
+            HandshakeStatus.READY -> to == HandshakeStatus.KEY_CHANGED_ALERT // Ready conversations cannot revert; only security alert allowed
+            HandshakeStatus.KEY_CHANGED_ALERT -> false // Security alert state cannot be bypassed automatically
+            HandshakeStatus.FAILED -> to in listOf(
+                HandshakeStatus.WAITING,
+                HandshakeStatus.NEW,
+                HandshakeStatus.KEY_CHANGED_ALERT
+            )
         }
     }
 }

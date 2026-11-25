@@ -59,6 +59,12 @@ object Curve25519Engine {
         return KeyPairBytes(priv, pub)
     }
 
+    fun getX25519PublicKeyFromPrivateKey(privateKey: ByteArray): ByteArray {
+        require(privateKey.size == KEY_SIZE) { "X25519 private key must be 32 bytes" }
+        val privParams = X25519PrivateKeyParameters(privateKey, 0)
+        return privParams.generatePublicKey().encoded
+    }
+
     fun computeSharedSecret(ourPrivateKey: ByteArray, peerPublicKey: ByteArray): ByteArray {
         require(ourPrivateKey.size == KEY_SIZE) { "X25519 private key must be 32 bytes" }
         require(peerPublicKey.size == KEY_SIZE) { "X25519 public key must be 32 bytes" }

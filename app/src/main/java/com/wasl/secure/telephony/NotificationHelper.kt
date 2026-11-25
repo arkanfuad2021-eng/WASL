@@ -50,7 +50,7 @@ class NotificationHelper(private val context: Context) {
         hideContent: Boolean = false
     ) {
         val intent = Intent(context, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
             putExtra("conversationId", conversationId)
         }
 
@@ -77,5 +77,12 @@ class NotificationHelper(private val context: Context) {
             .build()
 
         notificationManager.notify(conversationId.hashCode(), notification)
+    }
+
+    /**
+     * Dismisses any active notification for a conversation once the user opens it.
+     */
+    fun cancelConversationNotification(conversationId: String) {
+        notificationManager.cancel(conversationId.hashCode())
     }
 }

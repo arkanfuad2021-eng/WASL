@@ -2,6 +2,7 @@ package com.wasl.secure
 
 import com.wasl.secure.domain.model.Conversation
 import com.wasl.secure.domain.model.HandshakeStatus
+import com.wasl.secure.telephony.MessageChunkManager
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -53,23 +54,15 @@ class Phase1VerificationTest {
 
     @Test
     fun test_post_encryption_sms_parts_estimation() {
-        // Short text (e.g. "مرحبا") -> Should fit in 1 SMS
+        // Short text (e.g. "مرحبا يا محمد") -> 23 UTF-8 bytes + 16 GCM tag = 39 <= 63 -> Fits in 1 SMS
         val shortText = "مرحبا يا محمد"
-        val parts1 = calculateEstimatedParts(shortText)
+        val parts1 = MessageChunkManager.estimateEncryptedSmsParts(shortText)
         assertEquals(1, parts1)
 
-        // Long text (e.g. 500 characters) -> Must accurately exceed 1 SMS
+        // Long text (500 Arabic chars = 1000 UTF-8 bytes + 16 GCM tag = 1016 bytes -> ceil(1016/63) = 17 SMS parts)
         val longText = "أ".repeat(500)
-        val parts2 = calculateEstimatedParts(longText)
-        assertTrue("Estimated parts should be greater than 3 for 500 chars", parts2 >= 4)
-    }
-
-    private fun calculateEstimatedParts(plainText: String): Int {
-        if (plainText.isEmpty()) return 1
-        val plainBytes = plainText.toByteArray(Charsets.UTF_8).size
-        val totalCipherBytes = plainBytes + 16 + 12 + 26
-        val base64Length = ((totalCipherBytes + 2) / 3) * 4
-        val parts = (base64Length + 129) / 130
-        return if (parts < 1) 1 else parts
+        val parts2 = MessageChunkManager.estimateEncryptedSmsParts(longText)
+        assertEquals(17, parts2)
+        assertTrue("Estimated parts should exceed 10-part high-cost warning threshold", parts2 > 10)
     }
 }

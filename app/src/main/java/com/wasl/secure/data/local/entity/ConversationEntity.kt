@@ -19,5 +19,10 @@ data class ConversationEntity(
     val peerIdentityKeyBase64: String?,   // Ed25519 Public Key
     val sessionKeyBase64: String?,        // Directional Key K_AB (encrypted with Keystore master key)
     val inboundSessionKeyBase64: String?, // Directional Key K_BA (encrypted with Keystore master key)
-    val nextOutboundCounter: Long = 1L    // Monotonic Counter for Nonce generation
+    val nextOutboundCounter: Long = 1L,   // Monotonic Counter for Nonce generation
+    val identityState: String = "UNPINNED", // UNPINNED, PINNED_TOFU, OUT_OF_BAND_VERIFIED, KEY_CHANGED_ALERT
+    val pendingConfirmationKeyBase64: String? = null, // Temporary confirmation key for responder awaiting CONFIRM
+    val pendingConfirmMessageId: String? = null,
+    val pendingConfirmTotalParts: Int = 0,
+    val pendingConfirmSentIndices: String = ""
 )
