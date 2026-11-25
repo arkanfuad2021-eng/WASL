@@ -23,14 +23,15 @@ jobs:
           distribution: 'temurin'
           cache: gradle
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
       - name: Install Android SDK Platform 34 & Build Tools 34.0.0
         run: |
           set -euo pipefail
-          (set +o pipefail; yes | sdkmanager --licenses >/dev/null)
-          sdkmanager --install "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -name sdkmanager -type f | sort -V | tail -n 1)"
+          test -x "$SDKMANAGER"
+          (set +o pipefail; yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses >/dev/null)
+          "$SDKMANAGER" --sdk_root="$SDK_ROOT" --install "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
 
       - name: Make Gradle Wrapper Executable
         run: chmod +x gradlew
