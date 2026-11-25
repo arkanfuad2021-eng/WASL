@@ -60,7 +60,7 @@ class WaslApplication : Application() {
         // 4. Initialize secure database using Keystore-wrapped DEK (No hardcoded passphrases)
         databaseSecurityManager = DatabaseSecurityManager(this, keystoreManager)
         val dek = databaseSecurityManager.getOrResolveDatabaseKey()
-        database = WaslDatabase.getInstance(this, dek)
+        database = WaslDatabase.getInstance(this, dek, databaseSecurityManager)
 
         // 5. Initialize SIM and Telephony SMS services
         simCardManager = SimCardManager(this, database)

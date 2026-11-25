@@ -51,6 +51,7 @@ class DatabaseSecurityManager(
      * Resolves, generates, or unwraps the 256-bit Database Encryption Key (DEK).
      * If an unmigrated legacy database is detected, performs a stateful crash-resilient migration.
      */
+    @Synchronized
     fun getOrResolveDatabaseKey(): ByteArray {
         val dbFile = context.getDatabasePath(DATABASE_NAME)
         val hasInitialized = vaultPrefs.getBoolean(KEY_DATABASE_INITIALIZED, false)
@@ -59,7 +60,7 @@ class DatabaseSecurityManager(
         // 1. Crash Recovery check before proceeding
         reconcileFileStateAfterCrash(dbFile)
 
-        // 2. Scenario: App was initialized previously, but database file is missing!
+        // 2. Scenario: App was initialized and opened previously, but database file is missing!
         if (hasInitialized && !dbFile.exists()) {
             throw IllegalStateException(
                 "تنبيه أمني حرج: ملف قاعدة البيانات المشفرة مفقود رغم تهيئته مسبقاً! " +
@@ -72,33 +73,64 @@ class DatabaseSecurityManager(
             return performSafeMigration(dbFile)
         }
 
-        // 4. Scenario: Normal initialized state -> Unwrap existing DEK
-        if (hasInitialized && wrappedDekBase64 != null) {
-            val wrappedBytes = Base64.decode(wrappedDekBase64, Base64.NO_WRAP)
-            return try {
-                keystoreManager.unwrapKey(wrappedBytes)
-            } catch (e: Exception) {
-                throw SecurityException(
-                    "تنبيه أمني حرج: تعذر فك تشفير مفتاح قاعدة البيانات من Android Keystore! " +
-                            "تم حظر فتح قاعدة البيانات أو استبدال المفتاح لحماية سجلات المستخدم من الفساد.", e
-                )
-            }
+        // 4. Scenario: Existing DB file with valid wrapped DEK & completed state
+        // Covers normal initialized launches AND recovery if dbFile was created before KEY_DATABASE_INITIALIZED was saved.
+        if (dbFile.exists() && wrappedDekBase64 != null && (hasInitialized || getMigrationState() == MigrationState.COMPLETED)) {
+            return unwrapExistingDek(wrappedDekBase64)
         }
 
-        // 5. Scenario: Clean first install on a fresh device -> Generate new DEK and store wrapped
-        if (!hasInitialized && !dbFile.exists()) {
+        // 5. Scenario: Pre-open crash recovery (first-install DEK generated & wrapped, DB file not yet created)
+        if (!hasInitialized && !dbFile.exists() && wrappedDekBase64 != null) {
+            return unwrapExistingDek(wrappedDekBase64)
+        }
+
+        // 6. Scenario: Clean first install on a fresh device -> Generate & persist wrapped DEK ONLY.
+        // KEY_DATABASE_INITIALIZED remains false until Room actually opens/creates the DB file via markDatabaseInitialized().
+        if (!hasInitialized && !dbFile.exists() && wrappedDekBase64 == null) {
             val newDek = keystoreManager.generateDatabaseEncryptionKey()
-            persistWrappedDek(newDek)
-            setMigrationState(MigrationState.COMPLETED)
-            vaultPrefs.edit().putBoolean(KEY_DATABASE_INITIALIZED, true).apply()
+            persistInitialCleanInstallDek(newDek)
             return newDek
         }
 
-        // 6. Any other corrupted / inconsistent state -> Fail secure!
+        // 7. Any other corrupted / inconsistent state -> Fail secure!
         throw SecurityException(
             "تنبيه أمني حرج: حالة غير متسقة لمخزن المفاتيح وقاعدة البيانات! " +
                     "تم إيقاف التطبيق لحماية البيانات من التلف أو إنشاء مفتاح بديل غير مصرح."
         )
+    }
+
+    /**
+     * Marks database initialization as complete once Room has actually opened or created
+     * the encrypted database file on disk.
+     */
+    @Synchronized
+    fun markDatabaseInitialized() {
+        val dbFile = context.getDatabasePath(DATABASE_NAME)
+        if (!dbFile.exists()) {
+            throw IllegalStateException(
+                "لا يمكن تأكيد تهيئة قاعدة البيانات قبل إنشاء ملف القاعدة فعلياً على القرص."
+            )
+        }
+        if (!vaultPrefs.getBoolean(KEY_DATABASE_INITIALIZED, false)) {
+            val committed = vaultPrefs.edit()
+                .putBoolean(KEY_DATABASE_INITIALIZED, true)
+                .commit()
+            if (!committed) {
+                throw IllegalStateException("تعذر تثبيت حالة تهيئة قاعدة البيانات على القرص.")
+            }
+        }
+    }
+
+    private fun unwrapExistingDek(wrappedDekBase64: String): ByteArray {
+        val wrappedBytes = Base64.decode(wrappedDekBase64, Base64.NO_WRAP)
+        return try {
+            keystoreManager.unwrapKey(wrappedBytes)
+        } catch (e: Exception) {
+            throw SecurityException(
+                "تنبيه أمني حرج: تعذر فك تشفير مفتاح قاعدة البيانات من Android Keystore! " +
+                        "تم حظر فتح قاعدة البيانات أو استبدال المفتاح لحماية سجلات المستخدم من الفساد.", e
+            )
+        }
     }
 
     /**
@@ -204,12 +236,10 @@ class DatabaseSecurityManager(
             File(legacyDbFile.absolutePath + "-wal").delete()
             File(legacyDbFile.absolutePath + "-shm").delete()
 
-            // Persist the wrapped new DEK and mark migration complete
-            persistWrappedDek(newDek)
-            setMigrationState(MigrationState.COMPLETED)
-            vaultPrefs.edit().putBoolean(KEY_DATABASE_INITIALIZED, true).apply()
+            // Atomically persist wrapped new DEK, COMPLETED state, and initialized flag BEFORE deleting backup
+            persistCompletedMigrationState(newDek)
 
-            // Clean up temporary backup after verified success
+            // Clean up temporary backup after verified & persisted success
             backupFile.delete()
 
             return newDek
@@ -233,28 +263,59 @@ class DatabaseSecurityManager(
         val backupFile = context.getDatabasePath(BACKUP_DB_NAME)
         val migratingFile = context.getDatabasePath(MIGRATING_DB_NAME)
 
-        // If migratingFile was left over, remove it
+        // If migratingFile was left over before completion, remove it
         if (migratingFile.exists() && getMigrationState() != MigrationState.COMPLETED) {
             migratingFile.delete()
         }
 
-        // If app crashed after legacyDbFile was renamed to .bak and .db is missing
+        // If app crashed after creating .bak and BEFORE atomic commit of COMPLETED state & wrapped key,
+        // restore .bak even if dbFile already points to an unrecorded migrated file.
+        if (backupFile.exists() && getMigrationState() != MigrationState.COMPLETED) {
+            if (dbFile.exists() && !dbFile.delete()) {
+                throw IllegalStateException("تعذر حذف الملف غير المثبَّت لاستعادة النسخة الاحتياطية لقاعدة البيانات")
+            }
+            if (!backupFile.renameTo(dbFile)) {
+                throw IllegalStateException("تعذر استعادة النسخة الاحتياطية لقاعدة البيانات بعد الانقطاع")
+            }
+            File(dbFile.absolutePath + "-wal").delete()
+            File(dbFile.absolutePath + "-shm").delete()
+        }
+
+        // Extra guard if .db is missing while .bak exists
         if (!dbFile.exists() && backupFile.exists()) {
             backupFile.renameTo(dbFile)
         }
 
-        // If app crashed after new db was active and .bak was left over
+        // If app crashed after atomic commit succeeded and .bak was left over
         if (dbFile.exists() && backupFile.exists() && getMigrationState() == MigrationState.COMPLETED) {
             backupFile.delete()
         }
     }
 
-    private fun persistWrappedDek(dek: ByteArray) {
+    private fun encodeWrappedDek(dek: ByteArray): String {
         val wrappedDek = keystoreManager.wrapKey(dek)
-        val wrappedBase64 = Base64.encodeToString(wrappedDek, Base64.NO_WRAP)
-        vaultPrefs.edit()
-            .putString(KEY_WRAPPED_DEK, wrappedBase64)
-            .apply()
+        return Base64.encodeToString(wrappedDek, Base64.NO_WRAP)
+    }
+
+    private fun persistInitialCleanInstallDek(dek: ByteArray) {
+        val committed = vaultPrefs.edit()
+            .putString(KEY_WRAPPED_DEK, encodeWrappedDek(dek))
+            .putString(KEY_MIGRATION_STATE, MigrationState.COMPLETED.name)
+            .commit()
+        if (!committed) {
+            throw IllegalStateException("تعذر حفظ مفتاح التشفير الأولي لقاعدة البيانات بشكل متزامن")
+        }
+    }
+
+    private fun persistCompletedMigrationState(dek: ByteArray) {
+        val committed = vaultPrefs.edit()
+            .putString(KEY_WRAPPED_DEK, encodeWrappedDek(dek))
+            .putString(KEY_MIGRATION_STATE, MigrationState.COMPLETED.name)
+            .putBoolean(KEY_DATABASE_INITIALIZED, true)
+            .commit()
+        if (!committed) {
+            throw IllegalStateException("تعذر حفظ حالة ومفتاح الترحيل المكتمل بشكل متزامن")
+        }
     }
 
     fun getMigrationState(): MigrationState {

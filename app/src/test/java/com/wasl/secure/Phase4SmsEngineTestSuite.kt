@@ -4,7 +4,11 @@ import com.wasl.secure.core.crypto.AesGcmCipher
 import com.wasl.secure.core.crypto.MonotonicNonceManager
 import com.wasl.secure.core.protocol.ChatMessageCodec
 import com.wasl.secure.core.protocol.ChatMessagePacket
+import com.wasl.secure.data.local.dao.MessageChunkDao
+import com.wasl.secure.data.local.entity.MessageChunkEntity
 import com.wasl.secure.domain.model.MessageStatus
+import com.wasl.secure.telephony.MessageChunkManager
+import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -50,49 +54,125 @@ class Phase4SmsEngineTestSuite {
         assertArrayEquals(ciphertext, decoded.ciphertextWithTag)
     }
 
+    /**
+     * Minimal in-memory DAO backing MessageChunkDao's real default processAndCheckChunkAtomic logic.
+     */
+    private class InMemoryMessageChunkDao : MessageChunkDao {
+        private val buffer = linkedMapOf<String, MessageChunkEntity>()
+
+        override suspend fun insertChunk(chunk: MessageChunkEntity): Long {
+            val pk = "${chunk.conversationId}_${chunk.messageId}_${chunk.attemptId}_${chunk.chunkIndex}"
+            if (buffer.containsKey(pk)) return -1L
+            buffer[pk] = chunk
+            return 1L
+        }
+
+        override suspend fun getChunksForAttempt(
+            conversationId: String,
+            messageId: String,
+            attemptId: String
+        ): List<MessageChunkEntity> = buffer.values
+            .filter { it.conversationId == conversationId && it.messageId == messageId && it.attemptId == attemptId }
+            .sortedBy { it.chunkIndex }
+
+        override suspend fun getChunkCountForAttempt(
+            conversationId: String,
+            messageId: String,
+            attemptId: String
+        ): Int = getChunksForAttempt(conversationId, messageId, attemptId).size
+
+        override suspend fun deleteChunksForAttempt(conversationId: String, messageId: String, attemptId: String) {
+            buffer.entries.removeIf {
+                it.value.conversationId == conversationId && it.value.messageId == messageId && it.value.attemptId == attemptId
+            }
+        }
+
+        override suspend fun deleteChunksForMessage(conversationId: String, messageId: String) {
+            buffer.entries.removeIf { it.value.conversationId == conversationId && it.value.messageId == messageId }
+        }
+
+        override suspend fun deleteChunksForMessage(messageId: String) {
+            buffer.entries.removeIf { it.value.messageId == messageId }
+        }
+
+        override suspend fun deleteChunksForConversation(conversationId: String, packetConversationId: String) {
+            buffer.entries.removeIf {
+                it.value.conversationId == conversationId || it.value.conversationId == packetConversationId
+            }
+        }
+
+        override suspend fun deleteExpiredChunks(expiryTimestamp: Long) {
+            buffer.entries.removeIf { it.value.receivedAt < expiryTimestamp }
+        }
+    }
+
     @Test
-    fun test_2_End_To_End_SMS_Encryption_Transmission_And_Decryption() {
+    fun test_2_End_To_End_SMS_Encryption_Transmission_And_Decryption() = runBlocking {
         val key = ByteArray(32) { (it + 1).toByte() } // Directional session key K_{A -> B}
         val nonceManager = MonotonicNonceManager(initialCounter = 1L)
         val (nonce, _) = nonceManager.generateNextNonce()
 
         val originalText = "رسالة سرية وموثقة عبر WASL SMS"
+        val plainBytes = originalText.toByteArray(Charsets.UTF_8)
         val convId = "0011223344556677"
         val msgId = "8899aabbccddeeff"
+        val attemptId = "0001"
         val seqNo = 1L
 
-        val aad = "$convId:$msgId:$seqNo:1/1".toByteArray(Charsets.UTF_8)
+        val totalExpectedChunks = MessageChunkManager.estimateEncryptedSmsParts(originalText)
+        assertTrue("Payload exceeding 63 ciphertext bytes must fragment into multiple SMS parts", totalExpectedChunks > 1)
 
-        // 1. Sender encrypts plaintext
+        val aad = "$convId:$msgId:$seqNo:1/$totalExpectedChunks".toByteArray(Charsets.UTF_8)
+
+        // 1. Sender encrypts plaintext once with parent AAD
         val encryptResult = AesGcmCipher.encrypt(
             key = key,
             nonce = nonce,
-            plaintext = originalText.toByteArray(Charsets.UTF_8),
+            plaintext = plainBytes,
             associatedData = aad
         )
 
-        // 2. Sender formats packet for SMS cellular transmission
-        val packet = ChatMessagePacket(
+        // 2. Sender fragments full ciphertext into SMS-sized packets (<= 63 bytes each)
+        val packets = MessageChunkManager.fragmentCiphertext(
             conversationId = convId,
             messageId = msgId,
+            attemptId = attemptId,
             sequenceNumber = seqNo,
-            chunkIndex = 1,
-            totalChunks = 1,
             nonce = nonce,
             ciphertextWithTag = encryptResult.ciphertextWithTag
         )
-        val smsTransmissionString = ChatMessageCodec.encode(packet)
+        assertEquals(totalExpectedChunks, packets.size)
 
-        // 3. Recipient receives raw SMS text from cellular tower
-        val receivedPacket = ChatMessageCodec.decode(smsTransmissionString)
-        assertNotNull(receivedPacket)
+        val smsTransmissionStrings = packets.map { packet ->
+            assertTrue(packet.ciphertextWithTag.size <= MessageChunkManager.MAX_CHUNK_PAYLOAD_BYTES)
+            val encoded = ChatMessageCodec.encode(packet)
+            assertTrue("Encoded SMS segment must fit within 160 ASCII chars", encoded.length <= 160)
+            encoded
+        }
 
-        // 4. Recipient decrypts and authenticates with AAD
+        // 3. Recipient decodes each SMS segment via ChatMessageCodec and buffers in MessageChunkManager
+        val chunkDao = InMemoryMessageChunkDao()
+        var reassembled: MessageChunkManager.ReassembledMessage? = null
+        smsTransmissionStrings.forEachIndexed { index, smsText ->
+            val decodedPacket = ChatMessageCodec.decode(smsText)
+            assertNotNull("Decoded SMS chunk ${index + 1} must not be null", decodedPacket)
+            reassembled = MessageChunkManager.processIncomingChunk(decodedPacket!!, chunkDao)
+            if (index < smsTransmissionStrings.lastIndex) {
+                assertNull("Message must stay incomplete until final chunk arrives", reassembled)
+            }
+        }
+
+        assertNotNull("All chunks arrived; reassembly must complete", reassembled)
+        assertEquals(totalExpectedChunks, reassembled!!.totalChunks)
+        assertArrayEquals(nonce, reassembled!!.nonce)
+        assertArrayEquals(encryptResult.ciphertextWithTag, reassembled!!.fullCiphertextWithTag)
+
+        // 4. Recipient decrypts and authenticates reassembled ciphertext with parent AAD
         val decryptedBytes = AesGcmCipher.decrypt(
             key = key,
-            nonce = receivedPacket!!.nonce,
-            ciphertextWithTag = receivedPacket.ciphertextWithTag,
-            associatedData = receivedPacket.getAad()
+            nonce = reassembled!!.nonce,
+            ciphertextWithTag = reassembled!!.fullCiphertextWithTag,
+            associatedData = reassembled!!.getParentAad()
         )
         val decryptedText = String(decryptedBytes, Charsets.UTF_8)
 

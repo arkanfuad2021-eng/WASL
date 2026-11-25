@@ -159,16 +159,39 @@ abstract class WaslDatabase : RoomDatabase() {
             }
         }
 
-        fun getInstance(context: Context, encryptionPassphrase: ByteArray): WaslDatabase {
+        fun getInstance(
+            context: Context,
+            encryptionPassphrase: ByteArray,
+            databaseSecurityManager: DatabaseSecurityManager? = null
+        ): WaslDatabase {
             require(encryptionPassphrase.isNotEmpty()) {
                 "انتهاك أمني حرج: لا يمكن فتح قاعدة بيانات وصل المشفرة دون مفتاح SQLCipher صالح وغير فارغ!"
             }
             return INSTANCE ?: synchronized(this) {
-                INSTANCE ?: buildDatabase(context, encryptionPassphrase).also { INSTANCE = it }
+                INSTANCE ?: buildDatabase(
+                    context,
+                    encryptionPassphrase,
+                    databaseSecurityManager
+                ).also { INSTANCE = it }
             }
         }
 
-        private fun buildDatabase(context: Context, encryptionPassphrase: ByteArray): WaslDatabase {
+        internal fun createInitializationCallback(
+            databaseSecurityManager: DatabaseSecurityManager
+        ): Callback {
+            return object : Callback() {
+                override fun onOpen(db: SupportSQLiteDatabase) {
+                    super.onOpen(db)
+                    databaseSecurityManager.markDatabaseInitialized()
+                }
+            }
+        }
+
+        private fun buildDatabase(
+            context: Context,
+            encryptionPassphrase: ByteArray,
+            databaseSecurityManager: DatabaseSecurityManager? = null
+        ): WaslDatabase {
             require(encryptionPassphrase.isNotEmpty()) {
                 "انتهاك أمني حرج: لا يمكن بناء قاعدة بيانات وصل دون مفتاح SQLCipher صالح!"
             }
@@ -181,6 +204,10 @@ abstract class WaslDatabase : RoomDatabase() {
 
             // Strictly disable destructive migration to protect user data from accidental drops
             // builder.fallbackToDestructiveMigration() is purposefully OMITTED.
+
+            if (databaseSecurityManager != null) {
+                builder.addCallback(createInitializationCallback(databaseSecurityManager))
+            }
 
             // Enforce SQLCipher database encryption with automatic passphrase array wiping
             val factory = SupportFactory(encryptionPassphrase, null, true)

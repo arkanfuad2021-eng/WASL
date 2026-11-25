@@ -2,9 +2,11 @@ package com.wasl.secure
 
 import android.content.Context
 import android.content.SharedPreferences
+import androidx.room.Room
 import com.wasl.secure.core.crypto.IdentityManager
 import com.wasl.secure.core.crypto.KeystoreManager
 import com.wasl.secure.data.local.DatabaseSecurityManager
+import com.wasl.secure.data.local.WaslDatabase
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -15,6 +17,7 @@ import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
@@ -40,7 +43,7 @@ class Phase1SecurityAndMigrationTest {
 
         // 2. Wrap DEK
         val wrappedDek = keystoreManager.wrapKey(rawDek)
-        assertTrue("Wrapped DEK must include IV and GCM tag", wrappedDek.size > 32 + 12 + 16)
+        assertTrue("Wrapped DEK must equal 12-byte IV + 32-byte ciphertext + 16-byte GCM tag (>= 60)", wrappedDek.size >= 32 + 12 + 16)
 
         // 3. Unwrap DEK and verify identity
         val unwrappedDek = keystoreManager.unwrapKey(wrappedDek)
@@ -120,25 +123,140 @@ class Phase1SecurityAndMigrationTest {
         }
     }
 
+    private fun buildRobolectricTestDatabase(
+        appContext: Context,
+        securityManager: DatabaseSecurityManager?
+    ): WaslDatabase {
+        // Uses Robolectric framework SQLite (not native SQLCipher) strictly to verify Room's Callback.onOpen lifecycle
+        val builder = Room.databaseBuilder(
+            appContext,
+            WaslDatabase::class.java,
+            DatabaseSecurityManager.DATABASE_NAME
+        ).allowMainThreadQueries()
+
+        if (securityManager != null) {
+            builder.addCallback(WaslDatabase.createInitializationCallback(securityManager))
+        }
+        return builder.build()
+    }
+
+    private fun cleanTestDatabaseState(appContext: Context, vaultPrefs: SharedPreferences) {
+        vaultPrefs.edit().clear().commit()
+        listOf(
+            DatabaseSecurityManager.DATABASE_NAME,
+            DatabaseSecurityManager.BACKUP_DB_NAME,
+            DatabaseSecurityManager.MIGRATING_DB_NAME
+        ).forEach { fileName ->
+            val file = appContext.getDatabasePath(fileName)
+            file.delete()
+            File(file.absolutePath + "-wal").delete()
+            File(file.absolutePath + "-shm").delete()
+        }
+    }
+
     @Test
     fun test_database_security_manager_first_install_generates_and_persists_dek() {
-        val dbSecurityManager = DatabaseSecurityManager(mockContext, keystoreManager)
-        val dek = dbSecurityManager.getOrResolveDatabaseKey()
-
-        assertNotNull(dek)
-        assertEquals(32, dek.size)
-        assertEquals(DatabaseSecurityManager.MigrationState.COMPLETED, dbSecurityManager.getMigrationState())
-
-        val vaultPrefs = mockContext.getSharedPreferences(
+        val appContext = RuntimeEnvironment.getApplication()
+        val vaultPrefs = appContext.getSharedPreferences(
             DatabaseSecurityManager.VAULT_PREFS_NAME,
             Context.MODE_PRIVATE
         )
-        assertTrue(vaultPrefs.getBoolean(DatabaseSecurityManager.KEY_DATABASE_INITIALIZED, false))
-        assertTrue(vaultPrefs.contains(DatabaseSecurityManager.KEY_WRAPPED_DEK))
+        val dbFile = appContext.getDatabasePath(DatabaseSecurityManager.DATABASE_NAME)
+        cleanTestDatabaseState(appContext, vaultPrefs)
 
-        // Subsequent call returns identical unwrapped DEK
-        val dekSecondCall = dbSecurityManager.getOrResolveDatabaseKey()
-        assertArrayEquals(dek, dekSecondCall)
+        var db: WaslDatabase? = null
+        try {
+            val firstLaunchManager = DatabaseSecurityManager(appContext, keystoreManager)
+            val dek = firstLaunchManager.getOrResolveDatabaseKey()
+
+            assertNotNull(dek)
+            assertEquals(32, dek.size)
+            assertEquals(DatabaseSecurityManager.MigrationState.COMPLETED, firstLaunchManager.getMigrationState())
+            assertTrue(vaultPrefs.contains(DatabaseSecurityManager.KEY_WRAPPED_DEK))
+            assertFalse(
+                "KEY_DATABASE_INITIALIZED must stay false until Room creates/opens the DB file",
+                vaultPrefs.getBoolean(DatabaseSecurityManager.KEY_DATABASE_INITIALIZED, false)
+            )
+            assertFalse("Database file is not created until Room actually opens it", dbFile.exists())
+
+            // Simulate process close/restart BEFORE Room creates/opens the DB file -> reuses wrapped DEK
+            val preOpenRetryManager = DatabaseSecurityManager(appContext, keystoreManager)
+            val dekBeforeOpen = preOpenRetryManager.getOrResolveDatabaseKey()
+            assertArrayEquals(
+                "Pre-open restart must reuse the existing wrapped DEK instead of generating a new key or entering lockdown",
+                dek,
+                dekBeforeOpen
+            )
+            assertFalse(vaultPrefs.getBoolean(DatabaseSecurityManager.KEY_DATABASE_INITIALIZED, false))
+
+            // Simulate actual Room initialization (build is lazy; onOpen commits KEY_DATABASE_INITIALIZED)
+            db = buildRobolectricTestDatabase(appContext, preOpenRetryManager)
+            assertFalse(
+                "Building RoomDatabase must not mark initialized before opening the DB",
+                vaultPrefs.getBoolean(DatabaseSecurityManager.KEY_DATABASE_INITIALIZED, false)
+            )
+
+            db.openHelper.writableDatabase
+            assertTrue("Room open must create the database file on disk", dbFile.exists())
+            assertTrue(
+                "KEY_DATABASE_INITIALIZED must become true after Room successfully opens the DB",
+                vaultPrefs.getBoolean(DatabaseSecurityManager.KEY_DATABASE_INITIALIZED, false)
+            )
+
+            // Subsequent launch returns identical unwrapped DEK
+            val secondLaunchManager = DatabaseSecurityManager(appContext, keystoreManager)
+            val dekSecondCall = secondLaunchManager.getOrResolveDatabaseKey()
+            assertArrayEquals(dek, dekSecondCall)
+        } finally {
+            db?.close()
+            cleanTestDatabaseState(appContext, vaultPrefs)
+        }
+    }
+
+    @Test
+    fun test_database_security_manager_recovers_when_db_file_exists_before_initialized_flag() {
+        val appContext = RuntimeEnvironment.getApplication()
+        val vaultPrefs = appContext.getSharedPreferences(
+            DatabaseSecurityManager.VAULT_PREFS_NAME,
+            Context.MODE_PRIVATE
+        )
+        val dbFile = appContext.getDatabasePath(DatabaseSecurityManager.DATABASE_NAME)
+        cleanTestDatabaseState(appContext, vaultPrefs)
+
+        var firstDb: WaslDatabase? = null
+        var recoveredDb: WaslDatabase? = null
+        try {
+            val firstLaunchManager = DatabaseSecurityManager(appContext, keystoreManager)
+            val initialDek = firstLaunchManager.getOrResolveDatabaseKey()
+            val wrappedDekBeforeCrash = vaultPrefs.getString(DatabaseSecurityManager.KEY_WRAPPED_DEK, null)
+            assertNotNull(wrappedDekBeforeCrash)
+
+            // Create DB file on disk without running initialization callback to simulate crash before flag commit
+            firstDb = buildRobolectricTestDatabase(appContext, securityManager = null)
+            firstDb.openHelper.writableDatabase
+            firstDb.close()
+            firstDb = null
+
+            assertTrue("Database file must exist on disk prior to flag persistence", dbFile.exists())
+            assertFalse(vaultPrefs.getBoolean(DatabaseSecurityManager.KEY_DATABASE_INITIALIZED, false))
+
+            // Restart must reuse existing wrapped DEK without triggering legacy migration or lockdown
+            val recoveryManager = DatabaseSecurityManager(appContext, keystoreManager)
+            val recoveredDek = recoveryManager.getOrResolveDatabaseKey()
+            assertArrayEquals(initialDek, recoveredDek)
+            assertEquals(
+                wrappedDekBeforeCrash,
+                vaultPrefs.getString(DatabaseSecurityManager.KEY_WRAPPED_DEK, null)
+            )
+
+            recoveredDb = buildRobolectricTestDatabase(appContext, recoveryManager)
+            recoveredDb.openHelper.writableDatabase
+            assertTrue(vaultPrefs.getBoolean(DatabaseSecurityManager.KEY_DATABASE_INITIALIZED, false))
+        } finally {
+            firstDb?.close()
+            recoveredDb?.close()
+            cleanTestDatabaseState(appContext, vaultPrefs)
+        }
     }
 
     @Test
